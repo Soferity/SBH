@@ -1,0 +1,324 @@
+name: 🤖 Orchestrator Engine
+
+on:
+  schedule:
+    # Heartbeat check every 15 minutes to monitor subagents and advance roadmap
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to execute (tick, plan, adopt, review, project, setup, chatops)'
+        required: false
+        default: 'tick'
+        type: choice
+        options:
+          - tick
+          - plan
+          - adopt
+          - review
+          - project
+          - setup
+          - chatops
+          - services
+  # NOTE: no repository_dispatch — nothing in the codebase sends dispatches
+  # (wake-ups use `gh workflow run`). A dead trigger only invites confusion
+  # about which path actually wakes the engine.
+
+jobs:
+  orchestrate:
+    # Repo-level kill switch (engine is case-insensitive, so False/OFF/No
+    # also stand it down at runtime — the gate enumerates common variants so
+    # a capitalized value doesn't spin runners idle for 2 min every tick).
+    # Unset/anything-else = on (null-safe: missing vars must NOT skip).
+    if: ${{ toJSON(vars.ORCHESTRATOR_ENABLED) == 'null' || vars.ORCHESTRATOR_ENABLED == '' || (vars.ORCHESTRATOR_ENABLED != '0' && vars.ORCHESTRATOR_ENABLED != 'false' && vars.ORCHESTRATOR_ENABLED != 'False' && vars.ORCHESTRATOR_ENABLED != 'FALSE' && vars.ORCHESTRATOR_ENABLED != 'no' && vars.ORCHESTRATOR_ENABLED != 'No' && vars.ORCHESTRATOR_ENABLED != 'NO' && vars.ORCHESTRATOR_ENABLED != 'off' && vars.ORCHESTRATOR_ENABLED != 'Off' && vars.ORCHESTRATOR_ENABLED != 'OFF') }}
+    concurrency:
+      group: orchestrator-singleton
+      cancel-in-progress: false
+    name: Run Orchestration Cycle
+    # Triggered by schedule, manual dispatch, or subagent wake events only.
+    # Slash comments are handled by chatops.yml (fast lane) and can request
+    # a cycle explicitly via /tick.
+    runs-on: ubuntu-latest
+    env:
+      ORCHESTRATOR_ENABLED: ${{ vars.ORCHESTRATOR_ENABLED }}
+      CLIENT_ID: ${{ vars.GH_CLIENT_ID || vars.CLIENT_ID || secrets.GH_CLIENT_ID || secrets.CLIENT_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY || secrets.APP_PRIVATE_KEY }}
+      OPENCODE_DISABLE_MODELS_FETCH: "true"
+      OPENCODE_DISABLE_AUTOUPDATE: "true"
+      OPENCODE_DISABLE_LSP_DOWNLOAD: "true"
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+      issues: write
+      discussions: write
+      # NOTE: GitHub Projects v2 needs a PAT with read/write:project scope
+      # (GH_PROJECT_TOKEN secret); GITHUB_TOKEN cannot access Projects v2.
+
+    steps:
+      - name: 🔑 Generate GitHub App Token (optional)
+        id: app-token
+        if: ${{ env.CLIENT_ID != '' && env.APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ env.CLIENT_ID }}
+          private-key: ${{ env.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # Cron pile-up guard: ticks can run 30 min against a 15-min cron, so
+      # queued duplicates would each burn ~2 min of setup discovering idle
+      # state. Exit early when an OLDER orchestrator run is already
+      # queued/active (the engine coalesces again post-setup as backstop).
+      - name: 🚦 Skip When An Older Tick Is Active
+        if: ${{ github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+        run: |
+          OLDER=$(gh run list --workflow orchestrator.yml --limit 10 --json databaseId,status \
+            --jq '[.[] | select((.status == "queued" or .status == "in_progress" or .status == "waiting") and .databaseId < ${{ github.run_id }})] | length')
+          if [ "${OLDER:-0}" != "0" ]; then
+            echo "An older orchestrator run is already active; skipping this scheduled tick."
+            gh run cancel ${{ github.run_id }} || exit 0
+          fi
+          echo "No older active run; proceeding."
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: 🥟 Setup Bun Runtime (engine + JS/TS products)
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+
+      # Product toolchains (polyglot): the engine itself needs only Bun, but
+      # conflict-resolution verification runs the PRODUCT stack's tests, so
+      # every toolchain is provisioned here too. Setup actions are no-ops
+      # when the stack is unused (fast cache hits, ~10-30s each).
+      - name: 🐹 Setup Go toolchain (Go products)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: 🦀 Setup Rust toolchain (Rust products)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: 🟣 Setup .NET SDK (.NET products)
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.x
+
+      - name: 🐍 Setup Python + pytest (Python products)
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          # NOTE: no `cache: pip` — it hard-fails on repos without
+          # requirements.txt/pyproject.toml (e.g. fresh template checkouts).
+          # Python tasks needing cache restore it inside their own run.
+
+      - name: 🐘 Setup PHP + Composer (PHP products)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: pcov
+          tools: composer
+
+      - name: ⚡ Cache Bun Modules & OpenCode Binary
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.bun/install/cache
+            ~/.bun/bin/opencode
+          # Lockfile + CLI pin in the key: a bun.lock-only change or an
+          # @opencode/cli bump must invalidate, or warm runners restore
+          # stale modules / skip the new binary forever.
+          key: ${{ runner.os }}-bun-cache-${{ hashFiles('package.json', 'bun.lock') }}-opencode-2.0.26
+          restore-keys: |
+            ${{ runner.os }}-bun-cache-
+
+      - name: ⚙️ Install OpenCode CLI
+        run: |
+          if ! command -v opencode &> /dev/null; then
+            echo "Installing OpenCode CLI..."
+            bun install -g --trust @opencode/cli@2.0.26
+          fi
+          echo "$HOME/.bun/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.bun/bin:$PATH"
+          mkdir -p "$HOME/.config/opencode"
+          printf '{\n  "permission": {\n    "*": "allow"\n  }\n}\n' > "$HOME/.config/opencode/opencode.json"
+          opencode --version || echo "OpenCode installed"
+
+      - name: 📦 Install Project Dependencies
+        # Frozen lockfile: CI must never resolve-and-rewrite bun.lock (dirty
+        # tree aborts branch checkouts; builds stop being reproducible).
+        # Lock drift fails fast here and gets fixed in a proper commit.
+        run: bun install --frozen-lockfile
+
+      - name: 📦 Restore ECC vendor content (cached, keyed by manifest)
+        uses: actions/cache@v6
+        with:
+          path: vendor/ecc
+          key: ecc-vendor-${{ hashFiles('vendor/ecc/.manifest.json') }}
+
+      - name: 🧩 Ensure ECC vendor (release download on cache miss)
+        # --all: vendor the FULL agent-facing surface (skills/rules/agents),
+        # not just the stack-curated subset — agents may load any staged
+        # skill on demand, and a subset vendor would silently hide the rest.
+        run: bun run scripts/install-ecc.ts --all
+
+      - name: 🧩 Stage ECC skills (toolchain-style, on-demand depth)
+        run: bun run scripts/stage-ecc-skills.ts
+
+      - name: 🧹 Restore generated ECC manifest (keep tree clean for branch ops)
+        # install-ecc.ts rewrites vendor/ecc/.manifest.json (tracked pin file);
+        # a dirty tree aborts every later branch checkout/merge. The staged
+        # skills are already copied — restoring the pin loses nothing.
+        run: git checkout -- vendor/ecc/.manifest.json 2>/dev/null || true
+
+      - name: 🌿 Ensure State and Integration Branches Exist
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Ensure develop / integration branch exists (single-repo only;
+          # in dual-repo mode content branches live in the data repo)
+          if [ -z "${DATA_REPO}" ]; then
+          if ! git rev-parse --verify origin/develop >/dev/null 2>&1; then
+            echo "Creating integration branch 'develop'..."
+            git checkout -b develop
+            git push origin develop
+            git checkout main
+          fi
+          fi
+
+      - name: 🐳 Docker Hub Login (optional, raises pull limits)
+        env:
+          DOCKERHUB_POOL: ${{ secrets.DOCKERHUB_POOL }}
+        run: |
+          # Credential pool: DOCKERHUB_POOL = JSON array
+          # [{"username":"u1","token":"t1"},...]. The account is picked by
+          # run ID modulo pool size, spreading pulls evenly with no state.
+          if [ -n "$DOCKERHUB_POOL" ]; then
+            N=$(echo "$DOCKERHUB_POOL" | jq 'length' 2>/dev/null || echo 0)
+            if [ "$N" -gt 0 ] 2>/dev/null; then
+              I=$(( GITHUB_RUN_ID % N )) || true
+              U=$(echo "$DOCKERHUB_POOL" | jq -r ".[$I].username // empty")
+              T=$(echo "$DOCKERHUB_POOL" | jq -r ".[$I].token // empty")
+              if [ -n "$U" ] && [ -n "$T" ]; then
+                LOGGED=0
+                for TRY in 1 2 3; do
+                  if echo "$T" | docker login -u "$U" --password-stdin; then LOGGED=1; break; fi
+                  echo "Pool login attempt $TRY/3 failed (auth endpoint?) — retrying in 10s..."
+                  sleep 10
+                done
+                if [ "$LOGGED" -eq 1 ]; then
+                  echo "Logged in as pool account #$((I + 1))/$N."
+                  exit 0
+                fi
+                echo "Pool login failed after 3 attempts; falling back."
+              else
+                echo "DOCKERHUB_POOL entry #$((I + 1)) is missing username/token — trying legacy pair."
+              fi
+            else
+              echo "DOCKERHUB_POOL unparsable (not a JSON array) — trying legacy pair."
+            fi
+          fi
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          else
+            echo "No Docker Hub credentials — anonymous pulls (rate-limited)."
+          fi
+
+      - name: 🐳 Start Project Services (if declared)
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_PROJECT_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_PROJECT_TOKEN }}
+          INTEGRATION_BRANCH: develop
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          DATA_PAT: ${{ steps.app-token.outputs.token || secrets.DATA_PAT }}
+          DOCKERHUB_POOL: ${{ secrets.DOCKERHUB_POOL }}
+        run: |
+          ACTION="${{ github.event.inputs.action || 'tick' }}"
+          bun run orchestrator/engine.ts --action=services
+          FILE="workspace/docker-compose.services.yml"
+          if [ ! -f "$FILE" ]; then
+            echo "No project services declared — skipping."
+            exit 0
+          fi
+          # Only actions that can execute tests need live services (tick:
+          # conflict-resolution verification; services: explicit request).
+          # plan/review/project/setup never run code — skip pulls entirely.
+          case "$ACTION" in
+            tick|services) ;;
+            *) echo "Skipping service startup for action=$ACTION (no tests run)."; exit 0;;
+          esac
+          echo "Starting ephemeral CI services from $FILE..."
+          # Pool rotation helper (re-login as another account on rate limit).
+          # DOCKERHUB_POOL is exposed to this step via env below.
+          pool_login() {
+            U=$(echo "$DOCKERHUB_POOL" | jq -r ".[$1].username // empty")
+            T=$(echo "$DOCKERHUB_POOL" | jq -r ".[$1].token // empty")
+            [ -n "$U" ] && [ -n "$T" ] && echo "$T" | docker login -u "$U" --password-stdin
+          }
+          POOL_SIZE=$(echo "${DOCKERHUB_POOL:-}" | jq 'length' 2>/dev/null || echo 0)
+          [ "$POOL_SIZE" -gt 0 ] 2>/dev/null || POOL_SIZE=0
+          START_IDX=0
+          if [ "$POOL_SIZE" -gt 0 ] 2>/dev/null; then START_IDX=$(( GITHUB_RUN_ID % POOL_SIZE )) || true; fi
+          ATTEMPT=0
+          ROTATED=0
+          while true; do
+            OUT=$(docker compose -f "$FILE" up -d --wait --wait-timeout 120 2>&1) && CODE=0 || CODE=$?
+            echo "$OUT" | tail -n 4
+            if [ "$CODE" -eq 0 ]; then break; fi
+            # Rate-limited account? Rotate to an untried pool account first.
+            if echo "$OUT" | grep -qi 'toomanyrequests\|rate limit'; then
+              if [ "$POOL_SIZE" -gt 1 ] && [ "$ROTATED" -lt $(( POOL_SIZE - 1 )) ]; then
+                NEXT=$(( (START_IDX + 1 + ROTATED) % POOL_SIZE )) || true
+                ROTATED=$(( ROTATED + 1 )) || true
+                if pool_login "$NEXT"; then
+                  echo "Rate limited — rotated to pool account #$(( NEXT + 1 ))/$POOL_SIZE."
+                  continue
+                fi
+              fi
+            fi
+            # Transient blips get plain retries (a failing rotation falls here too).
+            ATTEMPT=$(( ATTEMPT + 1 )) || true
+            if [ "$ATTEMPT" -ge 5 ]; then
+              echo "Services failed to start after 5 attempts."
+              exit 1
+            fi
+            echo "Compose up failed (attempt $ATTEMPT/5) — retrying in 30s..."
+            sleep 30
+          done
+          if [ -f "workspace/.services.env" ]; then
+            cat "workspace/.services.env" >> "$GITHUB_ENV"
+            echo "Service env exported."
+          fi
+
+      - name: 🚀 Run Orchestrator Engine
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_PROJECT_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_PROJECT_TOKEN }}
+          OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL }}
+          OPENCODE_VARIANT: ${{ secrets.OPENCODE_VARIANT }}
+          MAX_CONCURRENT_SUBAGENTS: 5
+          INTEGRATION_BRANCH: develop
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          DATA_PAT: ${{ steps.app-token.outputs.token || secrets.DATA_PAT }}
+          PUBLIC_FEATURES: ${{ vars.PUBLIC_FEATURES }}
+          DATA_FEATURES: ${{ vars.DATA_FEATURES }}
+          GH_CLIENT_ID: ${{ vars.GH_CLIENT_ID || vars.CLIENT_ID || secrets.GH_CLIENT_ID || secrets.CLIENT_ID }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY || secrets.APP_PRIVATE_KEY }}
+        run: |
+          ACTION="${{ github.event.inputs.action || 'tick' }}"
+          bun run orchestrator/engine.ts --action=$ACTION
+

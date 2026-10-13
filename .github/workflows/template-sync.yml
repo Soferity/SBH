@@ -1,0 +1,98 @@
+name: 🔄 Template Sync
+
+# Pulls engine updates from the template repo (Taiizor/Orchestrator) as a
+# reviewable PR. Never auto-merges: the operator merges when calm.
+# By default syncs from Taiizor/Orchestrator. Can be customized via:
+# Actions Variables -> TEMPLATE_UPSTREAM = <template-owner>/<template-repo>
+# Runs weekly + on demand. Automatically skips on the template repo itself.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    # Null-safe: an unset TEMPLATE_UPSTREAM is null (not ''), and null != ''
+    # is TRUE — without the null check the template repo would sync itself.
+    if: github.repository != 'Taiizor/Orchestrator' || (vars.TEMPLATE_UPSTREAM != null && vars.TEMPLATE_UPSTREAM != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UPSTREAM: ${{ vars.TEMPLATE_UPSTREAM || 'Taiizor/Orchestrator' }}
+      CLIENT_ID: ${{ vars.GH_CLIENT_ID || vars.CLIENT_ID || secrets.GH_CLIENT_ID || secrets.CLIENT_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY || secrets.APP_PRIVATE_KEY }}
+    steps:
+      - name: 🔑 Generate GitHub App Token (optional)
+        id: app-token
+        if: ${{ env.CLIENT_ID != '' && env.APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ env.CLIENT_ID }}
+          private-key: ${{ env.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: 📥 Checkout product repo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: 🔍 Check template for updates
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream main
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Template is $BEHIND commits ahead."
+
+      - name: 🌿 Merge template into sync branch
+        if: steps.check.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+        run: |
+          # Unique branch per run: date-only names collide on same-day reruns
+          # (checkout -b fails, no PR, silent missed sync).
+          BRANCH="chore/template-sync-$(date -u +%Y%m%d)-${GITHUB_RUN_ID:-manual}"
+          echo "branch=$BRANCH" >> "$GITHUB_ENV"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          if git merge "upstream/main" --allow-unrelated-histories -m "chore(sync): merge template ${UPSTREAM}"; then
+            echo "merge=clean" >> "$GITHUB_ENV"
+          else
+            git merge --abort 2>/dev/null || true
+            echo "merge=conflict" >> "$GITHUB_ENV"
+          fi
+          git push -u origin "$BRANCH" || git push origin "$BRANCH"
+
+      - name: 📝 Open sync PR (clean merge)
+        if: steps.check.outputs.behind != '0' && env.merge == 'clean'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create --base main --head "$BRANCH" \
+            --title "🔄 Template sync: ${UPSTREAM}" \
+            --body "Engine updates from the template repo (\`${UPSTREAM}\`). Review, then merge when calm — never during an active milestone push." \
+          || echo "Sync PR already exists."
+
+      - name: 🚨 Open issue (conflicted merge)
+        if: steps.check.outputs.behind != '0' && env.merge == 'conflict'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create agents --description "Autonomous agent tasks" --color "0E8A16" --force 2>/dev/null || true
+          gh issue create \
+            --title "🚨 Template sync needs manual resolution" \
+            --body "Automatic merge of \`${UPSTREAM}\` conflicted with product divergences. Resolve locally: \`git fetch upstream && git merge upstream/main\`." \
+            --label agents \
+          || echo "Conflict issue already exists."

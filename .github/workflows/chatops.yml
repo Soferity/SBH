@@ -1,0 +1,85 @@
+name: 💬 ChatOps Fast Lane
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  chatops:
+    name: 💬 ChatOps Fast Lane
+    # Standalone fast lane: answers operator commands in ~1 min without
+    # running the heavy tick (slash comments no longer trigger
+    # orchestrator.yml). Only fires on human slash comments on issues:
+    # bot-authored comments (dispatch notices, reviews — the bot is the most
+    # prolific commenter) and PR comments (engine only reads the dashboard
+    # issue) are skipped before any runner spins up.
+    concurrency:
+      group: chatops-singleton
+      cancel-in-progress: false
+    if: github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/') && github.event.comment.user.type != 'Bot' && !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    env:
+      CLIENT_ID: ${{ vars.GH_CLIENT_ID || vars.CLIENT_ID || secrets.GH_CLIENT_ID || secrets.CLIENT_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY || secrets.APP_PRIVATE_KEY }}
+      OPENCODE_DISABLE_MODELS_FETCH: "true"
+      OPENCODE_DISABLE_AUTOUPDATE: "true"
+      OPENCODE_DISABLE_LSP_DOWNLOAD: "true"
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+      issues: write
+      discussions: write
+
+    steps:
+      - name: 🔑 Generate GitHub App Token (optional)
+        id: app-token
+        if: ${{ env.CLIENT_ID != '' && env.APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ env.CLIENT_ID }}
+          private-key: ${{ env.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: 🥟 Setup Bun Runtime
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+
+      - name: ⚙️ Install OpenCode CLI
+        run: |
+          if ! command -v opencode &> /dev/null; then
+            echo "Installing OpenCode CLI..."
+            bun install -g --trust @opencode/cli@2.0.26
+          fi
+          echo "$HOME/.bun/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.bun/bin:$PATH"
+          mkdir -p "$HOME/.config/opencode"
+          printf '{\n  "permission": {\n    "*": "allow"\n  }\n}\n' > "$HOME/.config/opencode/opencode.json"
+          opencode --version || echo "OpenCode installed"
+
+      - name: 📦 Install Project Dependencies
+        # Frozen lockfile (see orchestrator.yml): never rewrite bun.lock on CI.
+        run: bun install --frozen-lockfile
+
+      - name: 💬 Run ChatOps Handler
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_PROJECT_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_PROJECT_TOKEN }}
+          OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL }}
+          OPENCODE_VARIANT: ${{ secrets.OPENCODE_VARIANT }}
+          INTEGRATION_BRANCH: develop
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          DATA_PAT: ${{ steps.app-token.outputs.token || secrets.DATA_PAT }}
+          PUBLIC_FEATURES: ${{ vars.PUBLIC_FEATURES }}
+          DATA_FEATURES: ${{ vars.DATA_FEATURES }}
+          GH_CLIENT_ID: ${{ vars.GH_CLIENT_ID || vars.CLIENT_ID || secrets.GH_CLIENT_ID || secrets.CLIENT_ID }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY || secrets.APP_PRIVATE_KEY }}
+        run: bun run orchestrator/engine.ts --action=chatops

@@ -1,0 +1,32 @@
+---
+name: container-services
+description: Fixed Docker endpoints for Postgres, Redis, Mongo, and S3 with ephemeral-data discipline. Use when connecting to project services locally or in CI.
+license: MIT
+compatibility: opencode
+---
+
+## What I do
+
+- Connect to real services in CI without per-project wiring.
+
+## When to use me
+
+Use when your task touches the database, cache, queue, documents, or object storage.
+
+## Endpoints (preset CI services; custom services add their own `env`)
+
+- PostgreSQL: `DATABASE_URL=postgres://postgres:postgres@localhost:5432/app`
+- Redis: `REDIS_URL=redis://localhost:6379`
+- MongoDB: `MONGO_URL=mongodb://localhost:27017/app`
+- S3 (Adobe S3Mock in CI, MinIO/R2/AWS-compatible): `S3_ENDPOINT=http://localhost:9090`, key `test` / secret `test`, bucket from `S3_BUCKET` (create it via SDK — buckets start empty), region `us-east-1`.
+- Custom services: read their documented `env` keys the same way (exported automatically).
+
+## Rules
+
+1. **Read env, hardcode nothing:** all connection values come from environment with these Docker defaults (same locally and in CI).
+2. **Ephemeral data:** containers reset every run — seed fixtures inside the task/test setup; never assume rows, buckets, or keys pre-exist (create the bucket if missing).
+3. **Docker-always, fail fast:** there are no fallback data layers. If a declared service is unreachable, fail with a clear error — never add SQLite/InMemory adapters.
+4. **Missing a container? Provision + request it:** `docker run -d --name <name> -p <host:container> <image:pinned-tag>` for your own run, then append `{ "name", "image", "env?", "ports?" }` to `workspace/services.request.json` so the orchestrator auto-adopts it into the canonical compose (durable from the next tick). Pinned tags only, throwaway defaults only, and document the env in `workspace/CONTRACTS.md`.
+5. **No production credentials:** the Docker defaults are throwaway; production uses secret-managed values via the same env names.
+6. **Key-in pattern (third-party APIs):** S3 above is the template — sandbox/emulator in CI, live service in production, IDENTICAL env names, config-only swap. Apply it to every external integration: vendor sandbox or emulator sidecar (declared as a custom service) for tests, owner-provided live keys afterwards, KEY-IN steps documented. Hand-written fakes only when no sandbox exists, always with a conformance test.
+7. **Containerized toolchains allowed:** the runner pre-provisions the six product toolchains (fast path), but any task MAY run its build/test inside a pinned toolchain image instead — `docker run --rm -v $(pwd):/w -w /w <image:pinned-tag> <toolchain command>` — when the runner lacks the toolchain (e.g. Android SDK, Xcode-adjacent, exotic compilers) or the version must be exact. Paste real output; pinned tags only, same as services.

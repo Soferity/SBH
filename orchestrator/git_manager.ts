@@ -1,0 +1,959 @@
+import { CONFIG } from "./config.ts";
+import * as GhQuota from "./gh_quota.ts";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { rmSync, mkdirSync, cpSync } from "node:fs";
+
+export class GitManager {
+  /**
+   * Run a shell command via Bun.spawn.
+   * timeoutMs > 0 kills the process group on expiry (returns exitCode 124
+   * with a marker) so hung CLIs can never stall a tick forever.
+   */
+  public static async run(
+    cmd: string[],
+    cwd = ".",
+    input?: string,
+    envOverrides?: Record<string, string>,
+    timeoutMs = 0
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    try {
+      const options: any = {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      };
+      if (envOverrides) {
+        options.env = { ...process.env, ...envOverrides };
+      }
+      if (input !== undefined) {
+        options.stdin = new Response(input).body;
+      }
+      const proc = Bun.spawn(cmd, options);
+      let timedOut = false;
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              timedOut = true;
+              try {
+                proc.kill();
+              } catch {
+                // already exited
+              }
+            }, timeoutMs)
+          : undefined;
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      const exitCode = await proc.exited;
+      if (timer) clearTimeout(timer);
+      if (timedOut) {
+        const out = {
+          stdout: stdout.trim(),
+          stderr: (stderr.trim() + `\n[TIMEOUT after ${timeoutMs}ms: ${cmd[0]}]`).trim(),
+          exitCode: 124,
+        };
+        if (cmd[0] === "gh") GhQuota.noteApiResult(out.stderr, out.exitCode);
+        return out;
+      }
+      const res = { stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+      // Quota awareness: 429/rate-limit text opens a cooldown window so
+      // cosmetic callers degrade instead of burning the shared budget.
+      // Local git plumbing never matches (no gh involved) — zero behavior
+      // change for merge/persist/dispatch paths.
+      if (cmd[0] === "gh") GhQuota.noteApiResult(res.stderr, res.exitCode);
+      return res;
+    } catch (err: any) {
+      return { stdout: "", stderr: err?.message || String(err), exitCode: 1 };
+    }
+  }
+
+  /**
+   * True when two refs share at least one commit. Three-dot diffs need a
+   * merge base; without one (e.g. a task branch forked from the wrong
+   * remote) diff tooling fails — callers must treat that as UNKNOWN,
+   * never as "no changes".
+   */
+  public static async haveCommonAncestor(a: string, b: string): Promise<boolean> {
+    await this.fetchAll();
+    const res = await this.run(["git", "merge-base", a, b]);
+    return res.exitCode === 0;
+  }
+
+  /**
+   * Commits on the branch unreachable from the base (i.e. real new work).
+   * Zero + empty diff means the agent produced nothing (merged branches keep
+   * their unique commits, so they never hit zero).
+   * Returns -1 when unknowable — including unrelated histories, where a
+   * two-dot range would yield a bogus full-branch count. Callers route -1
+   * to review, never to auto-complete.
+   */
+  public static async branchUniqueCommits(branchName: string, baseBranch: string): Promise<number> {
+    const remote = this.contentRemote();
+    const base = baseBranch || CONFIG.INTEGRATION_BRANCH;
+    if (!(await this.haveCommonAncestor(`${remote}/${base}`, `${remote}/${branchName}`))) {
+      return -1;
+    }
+    const res = await this.run(["git", "rev-list", "--count", `${remote}/${base}..${remote}/${branchName}`]);
+    if (res.exitCode === 0 && /^\d+$/.test(res.stdout.trim())) {
+      return parseInt(res.stdout.trim(), 10);
+    }
+    return -1;
+  }
+
+  /**
+   * Newest commit timestamp (ms) among branch-unique commits, or -1 when the
+   * branch adds nothing over base. Unlike tip time, this ignores inherited
+   * history — a no-op publish pointing at a recent develop commit reads stale.
+   */
+  public static async branchUniqueTipTime(branchName: string, baseBranch: string): Promise<number> {
+    const remote = this.contentRemote();
+    const base = baseBranch || CONFIG.INTEGRATION_BRANCH;
+    if (!(await this.haveCommonAncestor(`${remote}/${base}`, `${remote}/${branchName}`))) {
+      return -1;
+    }
+    const res = await this.run(["git", "log", "-1", "--format=%ct", `${remote}/${base}..${remote}/${branchName}`]);
+    if (res.exitCode === 0 && /^\d+$/.test(res.stdout.trim())) {
+      return parseInt(res.stdout.trim(), 10) * 1000;
+    }
+    return -1;
+  }
+
+  /**
+   * Tip commit SHA of a content branch, or null when unresolvable.
+   * Used to skip re-reviewing unchanged branches (LLM cost saver).
+   */
+  public static async branchTipSha(branchName: string): Promise<string | null> {
+    await this.fetchAll();
+    const remote = this.contentRemote();
+    for (const ref of [`${remote}/${branchName}`, branchName]) {
+      const res = await this.run(["git", "rev-parse", ref]);
+      const sha = res.stdout.trim();
+      if (res.exitCode === 0 && /^[0-9a-f]{40}$/.test(sha)) return sha;
+    }
+    return null;
+  }
+
+  /**
+   * Last-commit timestamp (ms) of a content branch tip, or -1 when the
+   * branch/ref is unknown. Used by the watchdog to tell live workers
+   * (fresh pushes) from dead ones.
+   */
+  public static async branchTipTime(branchName: string): Promise<number> {
+    const remote = this.contentRemote();
+    for (const ref of [`${remote}/${branchName}`, branchName]) {
+      const res = await this.run(["git", "log", "-1", "--format=%ct", ref]);
+      if (res.exitCode === 0 && /^\d+$/.test(res.stdout.trim())) {
+        return parseInt(res.stdout.trim(), 10) * 1000;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Configure Git author identity for automated CI commits
+   */
+  public static async setupGitAuthor(): Promise<void> {
+    await this.run(["git", "config", "user.name", "github-actions[bot]"]);
+    await this.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"]);
+  }
+
+  // =====================================================================
+  // Dual-repo layer (public skeleton + private data repo).
+  // Data mode is ON when CONFIG.DATA_REPO is set. Content branches
+  // (task/*, develop) and the inputs//workspace/ trees then live in the
+  // data repo; this public repo keeps engine code + state/* only.
+  // =====================================================================
+
+  /** True when content branches live in the private data repo. */
+  public static isDataMode(): boolean {
+    return !!CONFIG.DATA_REPO.trim();
+  }
+
+  /** Remote carrying content branches: "data" or legacy "origin". */
+  public static contentRemote(): string {
+    return this.isDataMode() ? CONFIG.DATA_REMOTE : "origin";
+  }
+
+  /** Normalize DATA_REPO ("owner/name" or https URL) to "owner/name". */
+  public static dataRepoSlug(): string | null {
+    const raw = (CONFIG.DATA_REPO || "").trim().replace(/\/+$/, "");
+    if (!raw) return null;
+    const m = raw.match(/github\.com[/:]([^/\s]+\/[^/\s]+?)(?:\.git)?$/);
+    if (m) return m[1].trim();
+    if (/^[^/\s]+\/[^/\s]+$/.test(raw)) return raw;
+    return null;
+  }
+
+  /**
+   * Effective data credential, whitespace-trimmed. Pasted secrets with
+   * trailing newlines are a classic silent-auth-failure source.
+   */
+  public static dataPat(): string {
+    return (CONFIG.DATA_PAT || "").trim();
+  }
+
+  /**
+   * Env override neutralizing the credential that actions/checkout stores
+   * (http.https://github.com/.extraheader with the PUBLIC repo's
+   * GITHUB_TOKEN). Without this, every data-remote call sends the wrong
+   * Authorization header and GitHub answers "Repository not found" — even
+   * with a perfectly valid PAT embedded in the URL.
+   */
+  private static dataGitEnv(): Record<string, string> {
+    return {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+      GIT_CONFIG_VALUE_0: "",
+      GIT_TERMINAL_PROMPT: "0",
+    };
+  }
+
+  /** git invocation for data-remote network ops (fetch/push/ls-remote). */
+  public static async dataGit(
+    args: string[],
+    cwd = ".",
+    input?: string
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    return this.run(["git", ...args], cwd, input, this.dataGitEnv());
+  }
+
+  /**
+   * Network op against a named remote: data-remote calls go through the
+   * extraheader-neutralized path, everything else uses ambient auth.
+   * (Neutralizing globally would break origin pushes that rely on the
+   * checkout-stored credential.)
+   */
+  public static async remoteGit(
+    remote: string,
+    args: string[],
+    cwd = ".",
+    input?: string
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    if (this.isDataMode() && remote === CONFIG.DATA_REMOTE) {
+      return this.dataGit(args, cwd, input);
+    }
+    return this.run(["git", ...args], cwd, input);
+  }
+
+  /**
+   * Register + fetch the data remote (PAT-authenticated). Idempotent.
+   * Returns false when DATA_REPO is unset or unreachable — callers fall
+   * back to single-repo behavior.
+   */
+  public static async ensureDataRemote(): Promise<boolean> {
+    if (!this.isDataMode()) return false;
+    const slug = this.dataRepoSlug();
+    if (!slug) {
+      console.warn(`⚠️ DATA_REPO value "${CONFIG.DATA_REPO}" is not a valid owner/name or URL. Single-repo fallback.`);
+      return false;
+    }
+    const remote = CONFIG.DATA_REMOTE;
+    const existing = await this.run(["git", "remote", "get-url", remote]);
+    const pat = this.dataPat();
+    let url = `https://github.com/${slug}.git`;
+    if (pat) {
+      url = `https://x-access-token:${pat}@github.com/${slug}.git`;
+      console.log(`🔑 Data remote auth: explicit DATA_PAT/GH_PROJECT_TOKEN (${pat.length} chars).`);
+    } else {
+      console.warn("⚠️ DATA_PAT (or GH_PROJECT_TOKEN) is empty; data remote may fail auth.");
+    }
+    if (existing.exitCode !== 0) {
+      await this.run(["git", "remote", "add", remote, url]);
+    } else {
+      // Refresh credentials in case the PAT rotated
+      await this.run(["git", "remote", "set-url", remote, url]);
+    }
+    // Scrub note: the PAT lives only in local .git/config of the ephemeral
+    // runner and is never printed (we never log remote URLs).
+    const fetchRes = await this.remoteGit(remote, ["fetch", remote]);
+    if (fetchRes.exitCode !== 0) {
+      console.warn(`⚠️ Could not fetch data remote "${slug}":`, fetchRes.stderr);
+      return false;
+    }
+    console.log(`📦 Data remote ready: ${slug} (content branches via "${remote}/...").`);
+    return true;
+  }
+
+  /**
+   * Materialize data content (inputs/, workspace/) from a data-remote branch
+   * into the workdir. Ignored by git locally, so public commits can't leak it.
+   * Tries the requested ref, then develop, then main (first-run bootstrap).
+   */
+  public static async syncDataIn(branch: string, paths: string[] = [CONFIG.INPUTS_DIR, CONFIG.WORKSPACE_DIR]): Promise<boolean> {
+    if (!this.isDataMode()) return true;
+    const remote = CONFIG.DATA_REMOTE;
+    const candidates = [branch, CONFIG.INTEGRATION_BRANCH, CONFIG.BASE_BRANCH];
+    // Per-PATH across refs: paths live on different branches (inputs-only
+    // seed on main, workspace on develop). Returning after the first hit
+    // left the other paths stale/missing — each path walks all refs.
+    const got = new Set<string>();
+    for (const p of paths) {
+      for (const ref of candidates) {
+        await this.remoteGit(remote, ["fetch", remote, ref]);
+        // Checkout paths individually: a data branch may legitimately lack
+        // some of them (e.g. inputs-only seed without workspace/ yet).
+        const res = await this.run(["git", "checkout", `${remote}/${ref}`, "--", p]);
+        if (res.exitCode === 0) {
+          console.log(`📥 Synced ${p} from ${remote}/${ref}.`);
+          got.add(p);
+          break;
+        }
+      }
+    }
+    if (got.size > 0) {
+      // Unstage immediately: these files must live in the workdir WITHOUT
+      // entering the index — staged state blocks later `checkout -B`
+      // switches ("would be overwritten") and leaks into unrelated commits.
+      await this.run(["git", "reset", "-q", "--", ...paths]);
+      return true;
+    }
+    console.log(`ℹ️ No data content found on ${remote} yet (fresh data repo?) — using local templates.`);
+    return false;
+  }
+
+  /** Materialize private runtime state (roadmap/progress) from data main. */
+  public static async syncStateIn(): Promise<boolean> {
+    return this.syncDataIn(CONFIG.BASE_BRANCH, [CONFIG.STATE_DIR]);
+  }
+
+  /**
+   * Read a file from a content branch (data-aware). Returns null when absent.
+   */
+  public static async showFile(branch: string, path: string): Promise<string | null> {
+    await this.fetchAll();
+    const remote = this.contentRemote();
+    const res = await this.run(["git", "show", `${remote}/${branch}:${path}`]);
+    if (res.exitCode === 0) return res.stdout;
+    const localRes = await this.run(["git", "show", `${branch}:${path}`]);
+    return localRes.exitCode === 0 ? localRes.stdout : null;
+  }
+
+  /**
+   * Fetch all remote branches
+   */
+  public static async fetchAll(): Promise<void> {
+    await this.run(["git", "fetch", "--all"]);
+  }
+
+  /**
+   * Check if a remote or local branch exists (content-remote aware)
+   */
+  public static async branchExists(branchName: string): Promise<boolean> {
+    const res = await this.run(["git", "rev-parse", "--verify", branchName]);
+    if (res.exitCode === 0) return true;
+    const remoteRes = await this.run(["git", "rev-parse", "--verify", `${this.contentRemote()}/${branchName}`]);
+    return remoteRes.exitCode === 0;
+  }
+
+  /**
+   * Get diff between a task branch and base branch (content-remote aware).
+   * Three-dot first (changes since fork); when histories are unrelated and
+   * no merge base exists, falls back to two-dot (tip-vs-tip) so reviewers
+   * still see content instead of a misleading empty diff.
+   */
+  public static async getBranchDiff(taskBranch: string, baseBranch: string): Promise<string> {
+    await this.fetchAll();
+    const remote = this.contentRemote();
+    const three = await this.run(["git", "diff", `${remote}/${baseBranch}...${remote}/${taskBranch}`]);
+    if (three.exitCode === 0) return three.stdout;
+    const localThree = await this.run(["git", "diff", `${baseBranch}...${taskBranch}`]);
+    if (localThree.exitCode === 0 && localThree.stdout.trim()) return localThree.stdout;
+    // Unrelated histories: tip-vs-tip needs no merge base.
+    const twoDot = await this.run(["git", "diff", `${remote}/${baseBranch}..${remote}/${taskBranch}`]);
+    if (twoDot.exitCode === 0) return twoDot.stdout;
+    return localThree.stdout;
+  }
+
+  /**
+   * List files changed on a task branch vs base branch.
+   * Returns null when the branches cannot be diffed at all (e.g. no
+   * common ancestor AND tip diff unavailable) — UNKNOWN, never [].
+   * An empty array means a successful diff with zero files.
+   * With excludeDeleted, pure removals are hidden: scope/secret/size rules
+   * judge what the task ADDED or changed, not repair-era files missing
+   * from its tree but alive on develop.
+   */
+  public static async getBranchFileList(
+    taskBranch: string,
+    baseBranch: string,
+    opts?: { excludeDeleted?: boolean }
+  ): Promise<string[] | null> {
+    await this.fetchAll();
+    const base = baseBranch || CONFIG.INTEGRATION_BRANCH;
+    const remote = this.contentRemote();
+    const filt = opts?.excludeDeleted ? ["--diff-filter=ACMR"] : [];
+    const res = await this.run(["git", "diff", "--name-only", ...filt, `${remote}/${base}...${remote}/${taskBranch}`]);
+    if (res.exitCode === 0) {
+      return res.stdout
+        .split("\n")
+        .map((f) => f.trim())
+        .filter(Boolean);
+    }
+    const localRes = await this.run(["git", "diff", "--name-only", ...filt, `${base}...${taskBranch}`]);
+    if (localRes.exitCode === 0) {
+      return localRes.stdout
+        .split("\n")
+        .map((f) => f.trim())
+        .filter(Boolean);
+    }
+    // Last resort: tip-vs-tip needs no merge base.
+    const twoDot = await this.run(["git", "diff", "--name-only", ...filt, `${remote}/${base}..${remote}/${taskBranch}`]);
+    if (twoDot.exitCode === 0) {
+      return twoDot.stdout
+        .split("\n")
+        .map((f) => f.trim())
+        .filter(Boolean);
+    }
+    return null;
+  }
+
+  /**
+   * Restore engine files (orchestrator/, subagents/, skills, manifest) from
+   * the public checkout after switching to a data-only branch. Data
+   * branches lack them, which breaks post-checkout dynamic imports and
+   * prompt reads (ENOENT). Warn-only; publish paths scrub the index so
+   * these never leak into data commits.
+   */
+  public static async restoreEngineFiles(): Promise<void> {
+    const eng = await this.run([
+      "git",
+      "checkout",
+      "origin/main",
+      "--",
+      "orchestrator",
+      "subagents",
+      ".opencode",
+      "package.json",
+    ]);
+    if (eng.exitCode !== 0) {
+      console.warn("⚠️ Engine file restore had issues:", (eng.stdout + eng.stderr).slice(0, 300));
+      return;
+    }
+    // Keep workdir files, drop them from the index (same anti-leak rule).
+    await this.run(["git", "reset", "-q", "--", "orchestrator", "subagents", ".opencode", "package.json"]);
+  }
+
+  /**
+   * Merge task branch into integration branch cleanly.
+   * Content push always targets the content remote (data repo in dual-repo
+   * mode) — task/develop branches must never leak to the public origin.
+   */
+  public static async mergeTaskBranch(taskBranch: string, targetBranch: string, commitMsg: string): Promise<boolean> {
+    await this.fetchAll();
+    const remote = this.contentRemote();
+    // Import the resolver BEFORE switching branches: afterwards the workdir
+    // holds a data-only tree and the module file is unreachable (ENOENT).
+    const { ConflictResolver } = await import("./conflict_resolver.ts");
+    // Remember where we are so the tick workdir is left intact afterwards.
+    const startRef = (await this.run(["git", "branch", "--show-current"])).stdout.trim() || "main";
+    // Clear staged leftovers (synced state etc.) — they abort the switch
+    // ("would be overwritten") and would pollute the merge commit.
+    await this.run(["git", "reset", "-q"]);
+    // Ensure local target tracks the content remote's integration branch
+    await this.run(["git", "checkout", "-B", targetBranch, `${remote}/${targetBranch}`]);
+    await this.restoreEngineFiles();
+    await this.remoteGit(remote, ["pull", remote, targetBranch]);
+
+    const mergeRes = await this.run(["git", "merge", "--no-ff", `${remote}/${taskBranch}`, "-m", commitMsg]);
+    if (mergeRes.exitCode !== 0) {
+      console.warn(
+        `⚠️ Merge conflict detected when merging ${taskBranch} into ${targetBranch}. Invoking AI Conflict Resolver...`
+      );
+
+      const resolved = await ConflictResolver.resolveConflicts();
+
+      if (resolved) {
+        console.log(`🎉 Merge conflict automatically resolved by AI for ${taskBranch}!`);
+        const rc = await this.run(["git", "commit", "-m", `chore(merge): resolve conflicts integrating ${taskBranch}`]);
+        if (rc.exitCode !== 0) {
+          // A failed resolve-commit is NOT an integration: abort so the next
+          // tick retries from a clean tree instead of recording COMPLETED
+          // over unmerged work.
+          console.error(`❌ Resolve commit failed for ${taskBranch}; aborting merge.`);
+          await this.run(["git", "merge", "--abort"]);
+          await this.run(["git", "checkout", startRef]);
+          return false;
+        }
+      } else {
+        console.error(`❌ Automated conflict resolution could not resolve ${taskBranch} safely. Aborting merge.`);
+        await this.run(["git", "merge", "--abort"]);
+        await this.run(["git", "checkout", startRef]);
+        return false;
+      }
+    }
+
+    let pushSuccess = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const pushRes = await this.remoteGit(remote, ["push", remote, targetBranch]);
+      if (pushRes.exitCode === 0) {
+        pushSuccess = true;
+        break;
+      }
+      if (attempt < 3) {
+        const delayMs = attempt * 2000 + Math.floor(Math.random() * 1000);
+        console.warn(
+          `⚠️ Push failed for merged ${targetBranch} (attempt ${attempt}/3). Backing off for ${delayMs}ms before pull & rebase...`
+        );
+        await Bun.sleep(delayMs);
+        await this.remoteGit(remote, ["pull", "--rebase", remote, targetBranch]);
+      } else {
+        console.error(`❌ Push failed for merged ${targetBranch} after 3 attempts:`, pushRes.stderr);
+      }
+    }
+    await this.run(["git", "checkout", startRef]);
+    return pushSuccess;
+  }
+
+  /**
+   * Publish adopted workspace content (inputs/ + workspace/, minus dependency
+   * trees and regenerable CI files — same exclusions as publishTaskBranch)
+   * onto a data-remote branch via an isolated linked worktree. Used by adopt
+   * to seed data/develop so future task branches have a fork point.
+   * Returns false on failure (never throws).
+   */
+  public static async publishWorkspaceTree(
+    branch = CONFIG.INTEGRATION_BRANCH,
+    commitMsg = "chore(adopt): seed adopted workspace content"
+  ): Promise<boolean> {
+    const remote = CONFIG.DATA_REMOTE;
+    const botIdentity = ["-c", "user.name=github-actions[bot]", "-c", "user.email=github-actions[bot]@users.noreply.github.com"];
+    const wtDir = join(tmpdir(), `data-tree-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
+    const wt = async (args: string[]) => this.run(["git", "-C", wtDir, ...args]);
+    const cleanup = async () => {
+      try {
+        await this.run(["git", "worktree", "remove", "--force", wtDir]);
+      } catch {
+        // Ephemeral runner; leftovers die with the VM (matters only locally).
+      }
+      try {
+        await this.run(["git", "worktree", "prune"]);
+      } catch {
+        // Best-effort.
+      }
+    };
+    // Mirror sources: force-add overrides gitignore; node_modules and the
+    // per-run services env must never travel (thousands of files / diff noise).
+    const mirrorFromWorkdir = async (dst: string) => {
+      for (const srcDir of [CONFIG.INPUTS_DIR, CONFIG.WORKSPACE_DIR]) {
+        const src = join(".", srcDir);
+        const target = join(dst, srcDir);
+        try {
+          rmSync(target, { recursive: true, force: true });
+          cpSync(src, target, {
+            recursive: true,
+            filter: (s) => !s.includes("node_modules") && !s.endsWith(".services.env"),
+          });
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    };
+    try {
+      await this.run(["git", "worktree", "prune"]);
+      rmSync(wtDir, { recursive: true, force: true });
+      const hasBranch = await this.remoteHasBranch(remote, branch);
+      const startPoint = hasBranch ? `${remote}/${branch}` : `${remote}/${CONFIG.BASE_BRANCH}`;
+      const add = await this.run(["git", "worktree", "add", "--detach", wtDir, startPoint]);
+      if (add.exitCode !== 0) {
+        console.warn("⚠️ Data tree worktree setup failed:", (add.stdout + add.stderr).slice(0, 300));
+        return false;
+      }
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        if (!(await mirrorFromWorkdir(wtDir))) {
+          console.warn("⚠️ Data tree mirror failed (attempt ${attempt}/3).");
+          return false;
+        }
+        await wt(["add", "-f", CONFIG.INPUTS_DIR, CONFIG.WORKSPACE_DIR]);
+        await wt(["reset", "-q", `${CONFIG.WORKSPACE_DIR}/node_modules`, `${CONFIG.WORKSPACE_DIR}/.services.env`]);
+        const commit = await wt([...botIdentity, "commit", "-m", commitMsg]);
+        if (commit.exitCode !== 0 && !/nothing to commit/i.test(commit.stdout + commit.stderr)) {
+          console.warn(`⚠️ Data tree commit failed:`, (commit.stdout + commit.stderr).slice(0, 300));
+          return false;
+        }
+        const push = await this.remoteGit(remote, ["push", remote, `HEAD:refs/heads/${branch}`], wtDir);
+        if (push.exitCode === 0) return true;
+        console.warn(`⚠️ Data tree push rejected (attempt ${attempt}/3). Re-syncing...`);
+        if (attempt < 3) {
+          await Bun.sleep(attempt * 2000);
+          await this.remoteGit(remote, ["fetch", remote, branch], wtDir);
+          await wt(["reset", "--hard", `${remote}/${branch}`]);
+        } else {
+          console.warn(`   ↳ push stderr: ${(push.stdout + push.stderr).slice(0, 300)}`);
+        }
+      }
+      return false;
+    } finally {
+      await cleanup();
+    }
+  }
+
+  /**
+   * Check if a branch exists on a remote (no local checkout needed).
+   */
+  public static async remoteHasBranch(remote: string, branch: string): Promise<boolean> {
+    const res = await this.remoteGit(remote, ["ls-remote", "--heads", remote, branch]);
+    return res.exitCode === 0 && res.stdout.trim().length > 0;
+  }
+
+  /**
+   * Write one file's content onto a data-remote branch (default: integration
+   * branch) via an isolated linked worktree — the main checkout is never
+   * switched. Creates the content from the remote default branch when the
+   * target branch is missing. Returns false on failure (never throws).
+   */
+  public static async publishFileToData(
+    relPath: string,
+    content: string,
+    commitMsg: string,
+    branch = CONFIG.INTEGRATION_BRANCH
+  ): Promise<boolean> {
+    const remote = CONFIG.DATA_REMOTE;
+    const botIdentity = ["-c", "user.name=github-actions[bot]", "-c", "user.email=github-actions[bot]@users.noreply.github.com"];
+    const wtDir = join(tmpdir(), `data-file-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
+    const wt = async (args: string[]) => this.run(["git", "-C", wtDir, ...args]);
+    const stageAndCommit = async (): Promise<boolean> => {
+      const dst = join(wtDir, relPath);
+      try {
+        mkdirSync(dirname(dst), { recursive: true });
+        await Bun.write(dst, content);
+      } catch {
+        return false;
+      }
+      await wt(["add", "-f", relPath]);
+      const commit = await wt([...botIdentity, "commit", "-m", commitMsg]);
+      return commit.exitCode === 0 || /nothing to commit/i.test(commit.stdout + commit.stderr);
+    };
+    const cleanup = async () => {
+      try {
+        await this.run(["git", "worktree", "remove", "--force", wtDir]);
+      } catch {
+        // Ephemeral runner; leftovers die with the VM (matters only locally).
+      }
+      try {
+        await this.run(["git", "worktree", "prune"]);
+      } catch {
+        // Best-effort.
+      }
+    };
+    try {
+      await this.run(["git", "worktree", "prune"]);
+      rmSync(wtDir, { recursive: true, force: true });
+      const hasBranch = await this.remoteHasBranch(remote, branch);
+      const startPoint = hasBranch ? `${remote}/${branch}` : `${remote}/${CONFIG.BASE_BRANCH}`;
+      const add = await this.run(["git", "worktree", "add", "--detach", wtDir, startPoint]);
+      if (add.exitCode !== 0) {
+        console.warn(`⚠️ Data file worktree setup failed for ${relPath}:`, (add.stdout + add.stderr).slice(0, 300));
+        return false;
+      }
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        if (!(await stageAndCommit())) {
+          console.warn(`⚠️ Data file stage/commit failed for ${relPath} (attempt ${attempt}/3).`);
+          return false;
+        }
+        const push = await this.remoteGit(remote, ["push", remote, `HEAD:refs/heads/${branch}`], wtDir);
+        if (push.exitCode === 0) return true;
+        console.warn(`⚠️ Data file push rejected for ${relPath} (attempt ${attempt}/3). Re-syncing...`);
+        if (attempt < 3) {
+          await Bun.sleep(attempt * 2000);
+          await this.remoteGit(remote, ["fetch", remote, branch], wtDir);
+          // Reset only the SCRATCH worktree, then loop re-applies the file.
+          await wt(["reset", "--hard", `${remote}/${branch}`]);
+        } else {
+          console.warn(`   ↳ push stderr: ${(push.stdout + push.stderr).slice(0, 300)}`);
+        }
+      }
+      return false;
+    } finally {
+      await cleanup();
+    }
+  }
+
+  /**
+   * Publish a task branch's data content (inputs//workspace/) to the content
+   * remote. Force-adds gitignored paths (-f) so agent output travels while
+   * the public origin never sees a byte of it.
+   */
+  public static async publishTaskBranch(branch: string, commitMsg: string): Promise<boolean> {
+    // Scrub the index first: file restores above (engine files, state) stage
+    // additions the data branch must never absorb. Only inputs/workspace
+    // travel in the publish commit.
+    await this.run(["git", "reset", "-q"]);
+    // Add paths SEPARATELY: one missing path must not nuke the other
+    // (a single `add` fails atomically, which once published NOTHING while
+    // reporting success downstream).
+    for (const p of [CONFIG.INPUTS_DIR, CONFIG.WORKSPACE_DIR]) {
+      const a = await this.run(["git", "add", "-f", p]);
+      if (a.exitCode !== 0) {
+        console.warn(`⚠️ git add -f ${p} failed:`, (a.stdout + a.stderr).slice(0, 300));
+      }
+    }
+    // Never publish dependency trees: `add -f` overrides gitignore, and an
+    // agent-side `bun install` inside workspace/ would otherwise commit
+    // thousands of node_modules files (broke diffs, reviews and merges).
+    // Same for `.services.env`: per-run rendered CI endpoints, regenerable
+    // every run — committing it only adds diff noise and scope-gate hits.
+    // Nested trees too (web/node_modules from a UI task's install): glob
+    // magic covers any depth. Unambiguous junk only — bin/obj are skipped
+    // because source scripts can legitimately live under bin/. PHP Composer
+    // and Go vendor trees are the same class of junk (a committed
+    // workspace/Son.Dash/vendor once flooded diffs and tripped the security
+    // scanner on third-party code).
+    await this.run(["git", "reset", "-q", `${CONFIG.WORKSPACE_DIR}/node_modules`]);
+    await this.run(["git", "reset", "-q", `${CONFIG.WORKSPACE_DIR}/.services.env`]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/node_modules/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/target/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/__pycache__/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/.venv/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/vendor/**"]);
+    // Runtime-generated product files: `add -f` overrides the product
+    // .gitignore, so Laravel test runs would otherwise publish their cache,
+    // throwaway storage probes and a 200k-line laravel.log (once tripped the
+    // payload scanner). Regenerable, never reviewable.
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/bootstrap/cache/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/storage/logs/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/storage/framework/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/.phpunit.result.cache"]);
+    // Framework build output (Nuxt/Next): regenerable, never reviewable —
+    // a backend task that touched the frontend tree once published 30 files
+    // of .nuxt/ generated types.
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/.nuxt/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/.next/**"]);
+    await this.run(["git", "reset", "-q", "--", ":(glob)**/.output/**"]);
+    const staged = await this.run(["git", "diff", "--cached", "--name-only"]);
+    const files = staged.stdout
+      .split("\n")
+      .map((f) => f.trim())
+      .filter(Boolean);
+    if (files.length === 0) {
+      // Empty stage: either a no-op republish (branch already carries work)
+      // or an agent that produced nothing. Only the former is success.
+      const unique = await this.branchUniqueCommits(branch, CONFIG.INTEGRATION_BRANCH);
+      if (unique > 0) {
+        console.log(`ℹ️ Nothing new to publish on ${branch} (work already on branch).`);
+        return true;
+      }
+      console.error(`❌ Nothing staged for publish on ${branch}: agent produced no committable output.`);
+      return false;
+    }
+    console.log(`📦 Publishing ${files.length} files to ${branch}.`);
+    const commitRes = await this.run(["git", "commit", "-m", commitMsg]);
+    if (commitRes.exitCode !== 0) {
+      console.warn("Data commit output:", commitRes.stdout || commitRes.stderr);
+      return false;
+    }
+    const remote = this.contentRemote();
+    const maxRetries = 3;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const pushRes = await this.remoteGit(remote, ["push", "-u", remote, `HEAD:refs/heads/${branch}`]);
+      if (pushRes.exitCode === 0) return true;
+      if (attempt < maxRetries) {
+        const delayMs = attempt * 2000 + Math.floor(Math.random() * 1000);
+        console.warn(
+          `⚠️ Push rejected for data branch ${branch} (attempt ${attempt}/${maxRetries}). Backing off for ${delayMs}ms...`
+        );
+        await Bun.sleep(delayMs);
+      } else {
+        console.error(`❌ Could not push data branch ${branch} to ${remote} after ${maxRetries} attempts:`, pushRes.stderr);
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Commit and push changes on current branch (e.g. state branch or main).
+   * Uses optimistic-concurrency retries: on push rejection, fetch + rebase
+   * and retry up to 3 times so parallel orchestrator/subagent writers
+   * don't silently drop state updates.
+   */
+  public static async commitAndPush(message: string, files: string[] = ["."], maxRetries = 3): Promise<boolean> {
+    for (const file of files) {
+      await this.run(["git", "add", file]);
+    }
+    const commitRes = await this.run(["git", "commit", "-m", message]);
+    if (
+      commitRes.exitCode !== 0 &&
+      !commitRes.stdout.includes("nothing to commit") &&
+      !commitRes.stderr.includes("nothing to commit")
+    ) {
+      console.warn("Git commit output:", commitRes.stdout || commitRes.stderr);
+    }
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const pushRes = await this.run(["git", "push"]);
+      if (pushRes.exitCode === 0) return true;
+      const delayMs = attempt * 2000 + Math.floor(Math.random() * 1000);
+      console.warn(`⚠️ Push rejected (attempt ${attempt}/${maxRetries}). Backing off for ${delayMs}ms before fetch & rebase...`);
+      await Bun.sleep(delayMs);
+      await this.run(["git", "fetch", "origin"]);
+      const rebaseRes = await this.run(["git", "pull", "--rebase"]);
+      if (rebaseRes.exitCode !== 0) {
+        console.error("❌ Rebase failed; aborting to avoid corrupting state:", rebaseRes.stderr);
+        await this.run(["git", "rebase", "--abort"]);
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Dispatch Subagent GitHub Actions workflow
+   */
+  public static async dispatchSubagentWorkflow(taskId: string, role: string, branch: string, stack?: string): Promise<boolean> {
+    console.log(`🚀 Dispatching GitHub Action for ${taskId} (${role}) on branch ${branch}...`);
+
+    // Using gh CLI (pre-installed in GitHub Actions runners)
+    const args = [
+      "gh",
+      "workflow",
+      "run",
+      CONFIG.SUBAGENT_WORKFLOW,
+      "-f",
+      `taskId=${taskId}`,
+      "-f",
+      `role=${role}`,
+      "-f",
+      `branch=${branch}`,
+    ];
+    if (stack) args.push("-f", `stack=${stack}`);
+    const res = await this.run(args);
+
+    if (res.exitCode !== 0) {
+      console.error(`Failed to dispatch workflow via gh CLI:`, res.stderr);
+      return false;
+    }
+
+    // Verify a run actually materialized: `gh workflow run` exiting 0 only
+    // means the API accepted the request — GitHub can still drop it
+    // silently (a lost dispatch once left a task IN_PROGRESS with no worker
+    // forever). Poll briefly for the new run; on absence report failure so
+    // the caller keeps the task PENDING for the next tick instead.
+    const since = Date.now() - 10_000;
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      await Bun.sleep(15_000);
+      const list = await this.run([
+        "gh",
+        "run",
+        "list",
+        "--workflow",
+        CONFIG.SUBAGENT_WORKFLOW,
+        "--limit",
+        "10",
+        "--json",
+        "databaseId,name,createdAt",
+      ]);
+      if (list.exitCode === 0) {
+        try {
+          const runs = JSON.parse(list.stdout) as Array<{ databaseId: number; name: string; createdAt: string }>;
+          const hit = runs.find((r) => r.name.includes(taskId) && Date.parse(r.createdAt) >= since);
+          if (hit) {
+            console.log(`✅ Workflow successfully dispatched for ${taskId} (run #${hit.databaseId}).`);
+            return true;
+          }
+        } catch {
+          /* unparseable list — retry */
+        }
+      }
+      console.log(`⏳ Dispatch of ${taskId} not visible yet (attempt ${attempt}/6)...`);
+    }
+    console.error(`❌ No workflow run materialized for ${taskId} after dispatch; keeping task queued.`);
+    return false;
+  }
+
+  /**
+   * Check status of GitHub workflow runs
+   */
+  public static async getRecentWorkflowRuns(workflowName: string): Promise<any[]> {
+    const res = await this.run([
+      "gh",
+      "run",
+      "list",
+      "--workflow",
+      workflowName,
+      "--json",
+      "databaseId,status,conclusion,name,headBranch,createdAt",
+    ]);
+
+    if (res.exitCode !== 0) {
+      return [];
+    }
+
+    try {
+      return JSON.parse(res.stdout);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Get all currently active (in_progress, queued, waiting, requested) subagent runs.
+   * Queries without --status filter and filters locally so queued runs are not missed.
+   */
+  public static async getActiveSubagentRuns(): Promise<any[]> {
+    const res = await this.run([
+      "gh",
+      "run",
+      "list",
+      "--workflow",
+      CONFIG.SUBAGENT_WORKFLOW,
+      "--limit",
+      "50",
+      "--json",
+      "databaseId,status,conclusion,name,displayTitle,headBranch,createdAt,updatedAt",
+    ]);
+
+    if (res.exitCode !== 0) return [];
+    try {
+      const runs = JSON.parse(res.stdout);
+      return runs.filter((r: any) => ["in_progress", "queued", "waiting", "requested", "pending"].includes(r.status));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Find the most recent workflow run for a given task branch (for runId tracking).
+   */
+  public static async findRunForBranch(branch: string): Promise<number | null> {
+    const runs = await this.getRecentWorkflowRuns(CONFIG.SUBAGENT_WORKFLOW);
+    const match = runs.find((r: any) => r.headBranch === branch);
+    // getRecentWorkflowRuns payload has no headBranch; fall back to full query
+    if (match?.databaseId) return match.databaseId;
+    const res = await this.run([
+      "gh",
+      "run",
+      "list",
+      "--workflow",
+      CONFIG.SUBAGENT_WORKFLOW,
+      "--limit",
+      "50",
+      "--json",
+      "databaseId,headBranch,createdAt",
+    ]);
+    if (res.exitCode !== 0) return null;
+    try {
+      const all = JSON.parse(res.stdout);
+      const hit = all.find((r: any) => r.headBranch === branch);
+      return hit ? hit.databaseId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Cancel an active subagent workflow run (intervene / redirect)
+   */
+  public static async cancelWorkflowRun(runId: number): Promise<boolean> {
+    console.log(`🛑 Cancelling workflow run ${runId}...`);
+    const res = await this.run(["gh", "run", "cancel", String(runId)]);
+    return res.exitCode === 0;
+  }
+
+  /**
+   * Get recent log tail of a specific workflow run
+   */
+  public static async getRunLogs(runId: number): Promise<string> {
+    const res = await this.run(["gh", "run", "view", String(runId), "--log"]);
+    return res.exitCode === 0 ? res.stdout.slice(-4000) : "";
+  }
+}

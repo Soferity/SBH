@@ -1,0 +1,42 @@
+node_modules/
+# bun.lock IS committed (reproducible CI with --frozen-lockfile); only the
+# legacy binary lock stays ignored.
+bun.lockb
+.env
+.env.local
+*.pem
+dist/
+*.log
+.DS_Store
+Thumbs.db
+state/*.tmp.md
+workspace/data/*.db
+workspace/data/*.db-wal
+workspace/data/*.db-shm
+# Dual-repo mode: project data lives in the private DATA_REPO and is
+# runtime-synced into the workdir. Never commit it to the public skeleton.
+# Tracked template files stay: inputs/README.md, inputs/spec.md,
+# inputs/assets/.gitkeep, inputs/references/.gitkeep, workspace/.gitkeep.
+# inputs/skills/ is tracked normally: forged + hand-added project skills are
+# methodology (generic patterns only, never secrets) and must persist.
+inputs/assets/*
+!inputs/assets/.gitkeep
+inputs/references/*
+!inputs/references/.gitkeep
+workspace/*
+!workspace/.gitkeep
+# Runtime state (roadmap/progress/spec): synced from the data repo in
+# dual-repo mode, never committed to the public skeleton.
+state/*
+!state/.gitkeep
+# Staged ECC skills (regenerable via bun run ecc:stage; never commit)
+.opencode/skills/ecc-*/
+.opencode/skills/.ecc-staged.json
+# ECC vendor content (fetched per-run from cache/release; never commit blobs).
+# ONLY the manifest + attribution travel: the manifest pins every file hash,
+# so fetched content is verified against it. See README (ECC section).
+vendor/ecc/*
+!vendor/ecc/.manifest.json
+!vendor/ecc/ATTRIBUTION.md
+# Local build cache (never commit)
+tsconfig.tsbuildinfo

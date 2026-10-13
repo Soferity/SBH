@@ -1,0 +1,433 @@
+import { CONFIG } from "./config.ts";
+import { GitManager } from "./git_manager.ts";
+import { TEST_EVIDENCE_RX, RUNNER_MARK_RX } from "./stacks.ts";
+import type { TaskItem } from "./types.ts";
+
+export interface GateResult {
+  passed: boolean;
+  failures: string[];
+  warnings: string[];
+  fileList: string[];
+  diffStat: string;
+}
+
+const REQUIRED_SECTIONS = ["done", "doing", "todo", "verification"];
+
+/** Check TASK_PROGRESS.md has all 4 structured sections with non-empty content. */
+export function hasStructuredProgress(content: string): boolean {
+  const lower = content.toLowerCase();
+  return REQUIRED_SECTIONS.every((s) => lower.includes(s));
+}
+
+export function missingSections(content: string): string[] {
+  const lower = content.toLowerCase();
+  return REQUIRED_SECTIONS.filter((s) => !lower.includes(s));
+}
+
+/**
+ * Runner-written placeholder progress (emitted when the agent left no
+ * report). Structurally valid but content-free — must never count as
+ * evidence of work.
+ */
+const DEFAULT_PROGRESS_MARKERS = [
+  "Executed task deliverables in workspace",
+  "Submitting for orchestrator review",
+  "Awaiting review and integration",
+];
+
+export function isDefaultProgress(content: string): boolean {
+  return DEFAULT_PROGRESS_MARKERS.some((m) => content.includes(m));
+}
+
+/** Minimal glob matcher supporting *, ** suffixes used in targetFiles. */
+export function globMatches(pattern: string, file: string): boolean {
+  // Normalize: strip trailing /** or /* or /
+  let p = pattern.trim();
+  if (p === "." || p === "./") return true;
+  if (p.endsWith("/**")) {
+    return file.startsWith(p.slice(0, -3));
+  }
+  if (p.endsWith("/*")) {
+    const base = p.slice(0, -2);
+    if (!file.startsWith(base + "/")) return false;
+    return !file.slice(base.length + 1).includes("/");
+  }
+  if (p.endsWith("/")) {
+    return file.startsWith(p);
+  }
+  if (p.includes("*")) {
+    // Escape regex, then * -> .*, ** -> .*
+    const rx = new RegExp(
+      "^" +
+        p
+          .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+          .replace(/\*\*/g, ".*")
+          .replace(/\*/g, ".*") +
+        "$"
+    );
+    return rx.test(file);
+  }
+  // Exact file or directory prefix
+  return file === p || file.startsWith(p.endsWith("/") ? p : p + "/");
+}
+
+/** Basename allowlist for build manifests/lockfiles (any depth). */
+const LOCKFILE_BASENAMES = new Set([
+  "go.mod",
+  "go.sum",
+  "go.work",
+  "go.work.sum",
+  "package.json",
+  "package-lock.json",
+  "bun.lock",
+  "bun.lockb",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "Cargo.toml",
+  "Cargo.lock",
+  "requirements.txt",
+  "requirements-dev.txt",
+  "poetry.lock",
+  "Pipfile.lock",
+  "composer.json",
+  "composer.lock",
+  "Gemfile.lock",
+  "pom.xml",
+]);
+
+function isLockfile(file: string): boolean {
+  const base = file.split("/").pop() || "";
+  return LOCKFILE_BASENAMES.has(base);
+}
+
+export function isAllowedFile(task: TaskItem, file: string): boolean {
+  // Always allow the task's own progress report and shared contracts updates
+  if (file === "workspace/TASK_PROGRESS.md") return true;
+  if (file === "workspace/CONTRACTS.md") return true;
+  // Runner-rendered CI artifacts (deterministic, regenerable): never scope
+  // violations, even when legacy publishes committed them onto old branches.
+  if (file === "workspace/.services.env") return true;
+  if (file === "workspace/docker-compose.services.yml") return true;
+  // Service auto-adopt requests: the tick validates and merges them into
+  // roadmap.services (durable from the next run).
+  if (file === "workspace/services.request.json") return true;
+  // Empty directory placeholders are legitimate scaffolding, not scope creep
+  if (file.endsWith("/.gitkeep") || file === ".gitkeep") return true;
+  // Build manifests and lockfiles are always in scope: a task that needs a
+  // module where none exists must init it (go.mod, package.json-adjacent
+  // locks), and builds must stay reproducible. Without this, the gate killed
+  // tasks for adding go.mod/go.sum (TASK-007) or web/bun.lock (TASK-013).
+  // Dependency TREES (node_modules/, target/, ...) are still violations —
+  // publish scrubs them before they reach review.
+  if (isLockfile(file)) return true;
+  if (file.startsWith("state/")) return false; // state files must only change via orchestrator
+  return (task.targetFiles || []).some((pat) => {
+    // targetFiles entries are workspace-relative; diff paths are repo-relative
+    return globMatches(pat, file);
+  });
+}
+
+const SECRET_PATTERNS: { name: string; rx: RegExp }[] = [
+  { name: "AWS access key", rx: /AKIA[0-9A-Z]{16}/ },
+  { name: "GitHub PAT", rx: /(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{50,})/ },
+  { name: "GitHub OAuth", rx: /gho_[A-Za-z0-9]{20,}/ },
+  { name: "Slack token", rx: /xox[bap]-/ },
+  { name: "OpenAI API key", rx: /sk-[A-Za-z0-9]{32,}/ },
+  { name: "Anthropic API key", rx: /sk-ant-[A-Za-z0-9_-]{32,}/ },
+  { name: "Stripe live key", rx: /[rs]k_live_[A-Za-z0-9]+/ },
+  { name: "Private key block", rx: /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/ },
+];
+// NOTE: no `.env`-string content pattern — filenames are covered by the
+// files rule below, and README-style "copy .env.example to .env" docs must
+// never fail the gate.
+
+const GENERIC_SECRET_RX =
+  /(api[_-]?key|secret|password|passwd|pwd|client[_-]?secret|access[_-]?token|auth[_-]?token|bearer|jwt)\s*[:=]\s*['"]([^'"]+)['"]/i;
+/** Values that are obviously synthetic fixtures, not leaked credentials. */
+const PLACEHOLDER_VALUE_RX = /(your|example|sample|placeholder|changeme|todo|test|mock|fake|dummy|xxx)/i;
+
+/** Added content lines only: deletions cannot leak, `+++` headers are noise. */
+function addedLines(diff: string): string[] {
+  return diff.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++"));
+}
+
+/**
+ * Added lines grouped by file (from `+++ b/<path>` hunk headers).
+ * Lets the generic-assignment rule exempt test fixtures, where fake
+ * secrets are the entire point.
+ */
+function addedLinesByFile(diff: string): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  let cur = "";
+  for (const raw of diff.split("\n")) {
+    const h = raw.match(/^\+\+\+ b\/(.+)$/);
+    if (h) {
+      cur = h[1].trim();
+      if (!map.has(cur)) map.set(cur, []);
+      continue;
+    }
+    if (raw.startsWith("+") && !raw.startsWith("+++") && cur) {
+      map.get(cur)!.push(raw);
+    }
+  }
+  return map;
+}
+
+/** Evidence-stamp verdict for a progress report: unstamped toolchain output
+ *  is pasted text, not executed proof (TASK-001 fabrication class). */
+export function checkEvidenceStamp(progressContent: string): "ok" | "missing-evidence" | "unstamped" {
+  if (!TEST_EVIDENCE_RX.test(progressContent)) return "missing-evidence";
+  if (!RUNNER_MARK_RX.test(progressContent)) return "unstamped";
+  return "ok";
+}
+
+/** Build-output dirs: generated bundles trip content heuristics (minified
+ *  SQL keywords, mock-looking strings). Secrets still scan everywhere —
+ *  a bundled key is a leak — but SQL/fallback/demo-content scans skip dist/.
+ */
+function isBuildOutput(file: string): boolean {
+  return /(^|\/)(dist|build|out|coverage|storybook-static)\//.test(file);
+}
+
+/** Paths whose secret-shaped literals are fixtures by definition. */
+function isTestPath(file: string): boolean {
+  return (
+    /(^|\/)(tests?|__tests__|__mocks__|__fixtures__|fixtures?|test-utils|e2e|cypress)\//i.test(file) ||
+    /\.(test|spec)\.[a-z]+$/i.test(file)
+  );
+}
+
+export function scanSecrets(diff: string, files: string[]): string[] {
+  const hits: string[] = [];
+  const added = addedLines(diff);
+  const text = added.join("\n");
+  for (const pat of SECRET_PATTERNS) {
+    if (pat.rx.test(text)) hits.push(pat.name);
+  }
+  // Generic assignments with NON-placeholder values, in NON-test files,
+  // with single-token values only. Test fixtures, human sentences
+  // ("Must mix...") and synthetic values go to warnings or nowhere.
+  // NOTE: NO build-output exemption — a bundled secret is still a leak.
+  for (const [file, lines] of addedLinesByFile(diff)) {
+    if (isTestPath(file)) continue;
+    for (const line of lines) {
+      const m = line.match(GENERIC_SECRET_RX);
+      if (m && !/\s/.test(m[2]) && !PLACEHOLDER_VALUE_RX.test(m[2])) {
+        hits.push("Generic secret assignment");
+        break;
+      }
+    }
+    if (hits.includes("Generic secret assignment")) break;
+  }
+  // Sensitive filenames — except the canonical `.env.example` template.
+  // Match actual .pem or .key extensions, not substring hits like sort.key.ts.
+  // Credential-store files are always reject-grade, anywhere (including the
+  // odd test path — a committed credentials.json is never a fixture).
+  if (
+    files.some((f) => {
+      const m = f.match(/(^|\/)\.env([^/]*)$/i);
+      if (m && m[2] !== ".example") return true;
+      if (/\.(pem|key)$/i.test(f)) return true;
+      return /(^|\/)(credentials\.json|secrets?\.ya?ml|secrets?\.json)$/i.test(f);
+    })
+  ) {
+    hits.push("Sensitive file (.env/.pem/.key/credentials/secrets) in changeset");
+  }
+  return [...new Set(hits)];
+}
+
+/** SQL keyword on a line that also builds strings → injection-shaped. */
+const SQL_KW_RX = /\b(SELECT|INSERT|UPDATE|DELETE|CREATE\s+TABLE|DROP\s+TABLE|WHERE)\b/i;
+const SQL_CONCAT_RX = /(\+\s*['"`]|[`'"]\s*\+|\$\{|%s|fmt\.Sprintf|format\(|Query\(.*\+|Exec\(.*\+)/;
+
+export function scanSqlInjection(diff: string): string[] {
+  const hits: string[] = [];
+  for (const [file, lines] of addedLinesByFile(diff)) {
+    if (isTestPath(file) || isBuildOutput(file)) continue;
+    if (!/\.(ts|js|tsx|jsx|go|py|php|rb|java|kt|cs|rs)$/i.test(file)) continue;
+    for (const line of lines) {
+      if (SQL_KW_RX.test(line) && SQL_CONCAT_RX.test(line)) {
+        hits.push(`Possible SQL concatenation in ${file}: ${line.slice(1, 100).trim()}`);
+        break;
+      }
+    }
+  }
+  return hits;
+}
+
+/** Embedded fallback data layers — Docker-always forbids every one of these. */
+const FALLBACK_RX = /better-sqlite3|:memory:|new Database\(\s*['"]|sqlite3?\.open\(\s*['"]|sql\.open\(\s*["']sqlite/i;
+
+export function scanFallbackLayers(diff: string): string[] {
+  const hits: string[] = [];
+  for (const [file, lines] of addedLinesByFile(diff)) {
+    if (isTestPath(file) || isBuildOutput(file)) continue;
+    if (!/\.(ts|js|tsx|jsx|go|py|php|rb|java|kt|cs|rs)$/i.test(file)) continue;
+    for (const line of lines) {
+      if (FALLBACK_RX.test(line)) {
+        hits.push(`Embedded fallback data layer in ${file}: ${line.slice(1, 100).trim()}`);
+        break;
+      }
+    }
+  }
+  return hits;
+}
+
+/** Heuristic tier (warn-only): mock-money literals and dead UI controls.
+ *  Too context-sensitive to fail closed — a finance test asserting on
+ *  "mock balance" text would false-positive — but reviewers must see them.
+ */
+export function scanDemoSmells(diff: string): string[] {
+  const warns: string[] = [];
+  const mockMoney = /(mock|fake|stub|placeholder|sample|demo)[-_ ]?(balance|fund|money|amount|ledger|payout)/i;
+  for (const [file, lines] of addedLinesByFile(diff)) {
+    if (isTestPath(file) || isBuildOutput(file)) continue;
+    for (const line of lines) {
+      if (mockMoney.test(line)) {
+        warns.push(`Mock-money literal in ${file} — confirm sandbox-backed proof, not demo funds`);
+        break;
+      }
+    }
+  }
+  for (const [file, lines] of addedLinesByFile(diff)) {
+    if (isTestPath(file) || isBuildOutput(file)) continue;
+    if (!/\.(tsx|jsx|vue|html|php|tsx?)$/i.test(file)) continue;
+    for (const line of lines) {
+      if (/href\s*=\s*["']#["']/.test(line)) {
+        warns.push(`Dead control href="#" in ${file} — every control must resolve (route/handler/shipped JS)`);
+        break;
+      }
+    }
+  }
+  return [...new Set(warns)];
+}
+
+/** Soft-tier: secret-shaped assignments with placeholder values. Warn only. */
+export function scanSecretWarnings(diff: string): string[] {
+  const warns: string[] = [];
+  for (const line of addedLines(diff)) {
+    const m = line.match(GENERIC_SECRET_RX);
+    if (m && PLACEHOLDER_VALUE_RX.test(m[2])) {
+      warns.push(`Placeholder secret-style assignment (${m[1]}=…) — verify no real credential before merge`);
+    }
+  }
+  return [...new Set(warns)];
+}
+
+function touchesApiOrSchema(files: string[]): boolean {
+  return files.some(
+    (f) =>
+      f.startsWith("workspace/src/api/") ||
+      f.startsWith("workspace/src/db/") ||
+      f.startsWith("workspace/src/services/") ||
+      f.startsWith("workspace/drizzle/")
+  );
+}
+
+/**
+ * Gate ruleset version. Bumped whenever deterministic rules change
+ * (scope lists, secret patterns, file filters): old verdicts recorded
+ * under a previous version must be re-evaluated, never skipped by the
+ * unchanged-tip optimization.
+ */
+export const GATE_VERSION = 9;
+
+/**
+ * Deterministic pre-LLM gate. Fails fast on empty diff, missing progress
+ * structure, secret hits, or out-of-scope writes. Warns on contract drift.
+ */
+export async function runReviewGate(task: TaskItem, diff: string, progressContent: string): Promise<GateResult> {
+  const failures: string[] = [];
+  const warnings: string[] = [];
+  const fileList = (await GitManager.getBranchFileList(task.branch, CONFIG.INTEGRATION_BRANCH, { excludeDeleted: true })) ?? [];
+  const remote = GitManager.contentRemote();
+  // Legacy fork check: branches that share no history with develop produce
+  // tip-vs-tip file lists (whole trees). File-level rules can't attribute
+  // those, so they are skipped with a warning; the reviewer judges content.
+  const lineageBroken = !(await GitManager.haveCommonAncestor(
+    `${remote}/${CONFIG.INTEGRATION_BRANCH}`,
+    `${remote}/${task.branch}`
+  ));
+  if (lineageBroken) {
+    warnings.push(
+      "Branch shares no history with develop (legacy fork); file-level scope/drift rules skipped — reviewer judges full tip diff."
+    );
+  }
+  const statRes = await GitManager.run([
+    "git",
+    "diff",
+    "--stat",
+    `${remote}/${CONFIG.INTEGRATION_BRANCH}...${remote}/${task.branch}`,
+  ]);
+  const diffStat = statRes.exitCode === 0 ? statRes.stdout.slice(0, 2000) : "";
+
+  if (!diff.trim() && fileList.length === 0) {
+    failures.push("Empty diff: task branch has no changes vs develop.");
+  }
+  if (!progressContent || progressContent === "No progress file provided.") {
+    failures.push("Missing workspace/TASK_PROGRESS.md on task branch.");
+  } else {
+    const missing = missingSections(progressContent);
+    if (missing.length > 0) {
+      failures.push(`TASK_PROGRESS.md missing sections: ${missing.join(", ")}.`);
+    }
+    if (isDefaultProgress(progressContent)) {
+      failures.push(
+        "TASK_PROGRESS.md is the runner placeholder, not an agent report: no evidence of work. Produce real Done/Verification content."
+      );
+    }
+    const stamp = checkEvidenceStamp(progressContent);
+    if (stamp === "missing-evidence") {
+      warnings.push(
+        "Verification section has no recognizable test evidence (bun test | go test | cargo test | dotnet test | pytest | phpunit output)."
+      );
+    } else if (stamp === "unstamped") {
+      // Anti-fabrication: evidence patterns with no runner stamp are pasted
+      // text, not executed proof (the TASK-001 class: plausible output the
+      // runner never produced). Fail closed — re-running the task re-stamps.
+      failures.push(
+        "Test evidence present but no [runner-executed] stamp: proof must come from the runner's own test execution, not pasted text."
+      );
+    }
+  }
+
+  const outOfScope = lineageBroken ? [] : fileList.filter((f) => !isAllowedFile(task, f));
+  if (outOfScope.length > 0) {
+    // Operator-created tasks (/add, /revise) carry no disjoint targetFiles
+    // scoping — warn instead of failing, the reviewer judges relevance.
+    if (!task.targetFiles || task.targetFiles.length === 0) {
+      warnings.push(
+        `Unscoped task touched ${outOfScope.length} files outside any targetFiles contract; reviewer must verify relevance.`
+      );
+    } else {
+      failures.push(
+        `Out-of-scope files modified (${outOfScope.slice(0, 10).join(", ")}${outOfScope.length > 10 ? ` +${outOfScope.length - 10} more` : ""}). Allowed: ${(task.targetFiles || []).join(", ")}.`
+      );
+    }
+  }
+
+  const secrets = scanSecrets(diff, fileList);
+  if (secrets.length > 0) {
+    failures.push(`Potential secret leak detected: ${secrets.join(", ")}.`);
+  }
+  for (const w of scanSecretWarnings(diff)) warnings.push(w);
+
+  // Injection + fallback layers fail closed (precise, low-FP patterns).
+  for (const hit of scanSqlInjection(diff)) {
+    failures.push(`Possible SQL injection (unparameterized query): ${hit}.`);
+  }
+  for (const hit of scanFallbackLayers(diff)) {
+    failures.push(`Embedded fallback data layer (Docker-always violation): ${hit}.`);
+  }
+  // Demo smells are heuristic — warn so the (LLM) reviewer sees them.
+  for (const w of scanDemoSmells(diff)) warnings.push(w);
+
+  if (!lineageBroken && touchesApiOrSchema(fileList) && !fileList.includes("workspace/CONTRACTS.md")) {
+    warnings.push("API/schema/services changed but workspace/CONTRACTS.md not updated (contract drift).");
+  }
+  if (!lineageBroken && fileList.includes("workspace/services.request.json") && !fileList.includes("workspace/CONTRACTS.md")) {
+    warnings.push("New Docker service requested but workspace/CONTRACTS.md not updated (env endpoints undocumented).");
+  }
+
+  return { passed: failures.length === 0, failures, warnings, fileList, diffStat };
+}

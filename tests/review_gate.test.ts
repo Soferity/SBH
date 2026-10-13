@@ -1,0 +1,226 @@
+import { describe, it, expect } from "bun:test";
+import {
+  hasStructuredProgress,
+  missingSections,
+  isDefaultProgress,
+  globMatches,
+  isAllowedFile,
+  checkEvidenceStamp,
+  scanSecrets,
+  scanSecretWarnings,
+  scanSqlInjection,
+  scanFallbackLayers,
+  scanDemoSmells,
+  GATE_VERSION
+} from "../orchestrator/review_gate.ts";
+
+describe("Review Gate Module", () => {
+  describe("hasStructuredProgress", () => {
+    it("should return true when all sections are present", () => {
+      const content = "## Done\nstuff\n## Doing\nstuff\n## Todo\nstuff\n## Verification\nstuff";
+      expect(hasStructuredProgress(content)).toBe(true);
+    });
+
+    it("should return false if any section is missing", () => {
+      const content = "## Done\nstuff\n## Doing\nstuff\n## Todo\nstuff";
+      expect(hasStructuredProgress(content)).toBe(false);
+    });
+  });
+
+  describe("missingSections", () => {
+    it("should return empty array when all sections exist", () => {
+      const content = "done doing todo verification";
+      expect(missingSections(content)).toEqual([]);
+    });
+
+    it("should return missing section names", () => {
+      const content = "done and doing";
+      expect(missingSections(content)).toEqual(["todo", "verification"]);
+    });
+  });
+
+  describe("isDefaultProgress", () => {
+    it("should return true for runner placeholder text", () => {
+      expect(isDefaultProgress("Some text Executed task deliverables in workspace here")).toBe(true);
+      expect(isDefaultProgress("Submitting for orchestrator review")).toBe(true);
+    });
+
+    it("should return false for genuine agent report", () => {
+      expect(isDefaultProgress("Added login page")).toBe(false);
+    });
+  });
+
+  describe("globMatches", () => {
+    it("should match exact file", () => {
+      expect(globMatches("src/index.ts", "src/index.ts")).toBe(true);
+      expect(globMatches("src/index.ts", "src/utils.ts")).toBe(false);
+    });
+
+    it("should match directory prefix with trailing slash", () => {
+      expect(globMatches("src/", "src/index.ts")).toBe(true);
+      expect(globMatches("src/", "tests/index.ts")).toBe(false);
+    });
+
+    it("should match * wildcard", () => {
+      expect(globMatches("src/*", "src/index.ts")).toBe(true);
+      expect(globMatches("src/*", "src/components/button.ts")).toBe(false);
+    });
+
+    it("should match ** recursive wildcard", () => {
+      expect(globMatches("src/**", "src/components/button.ts")).toBe(true);
+      expect(globMatches("src/**", "src/index.ts")).toBe(true);
+      expect(globMatches("src/**", "tests/index.ts")).toBe(false);
+    });
+
+    it("should match dot or ./", () => {
+      expect(globMatches(".", "src/index.ts")).toBe(true);
+      expect(globMatches("./", "package.json")).toBe(true);
+    });
+  });
+
+  describe("scanSecrets", () => {
+    const files = ["workspace/src/app.ts"];
+
+    it("should detect AWS keys", () => {
+      const diff = "+ const aws = 'AKIA1234567890123456';";
+      expect(scanSecrets(diff, files)).toContain("AWS access key");
+    });
+
+    it("should detect GitHub PATs", () => {
+      const diff1 = "+ const token = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';";
+      expect(scanSecrets(diff1, files)).toContain("GitHub PAT");
+      const diff2 = "+ const token = 'github_pat_11AAAAAAA0123456789_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLM';";
+      expect(scanSecrets(diff2, files)).toContain("GitHub PAT");
+    });
+
+    it("should detect OpenAI and Anthropic API keys", () => {
+      const diff1 = "+ const key = 'sk-1234567890abcdef1234567890abcdef12';";
+      expect(scanSecrets(diff1, files)).toContain("OpenAI API key");
+      const diff2 = "+ const key = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890';";
+      expect(scanSecrets(diff2, files)).toContain("Anthropic API key");
+    });
+
+    it("should detect generic secrets with real-looking values", () => {
+      const diff = "+++ b/workspace/src/app.ts\n+ const API_KEY = 'real_secret_value_here';";
+      expect(scanSecrets(diff, files)).toContain("Generic secret assignment");
+    });
+
+    it("should ignore placeholder generic secrets", () => {
+      const diff = "+ const API_KEY = 'your_api_key_here';";
+      expect(scanSecrets(diff, files)).not.toContain("Generic secret assignment");
+    });
+
+    it("should ignore generic secrets in test files", () => {
+      const diff = "+++ b/workspace/tests/app.test.ts\n+ const secret = 'real_secret_value_here';";
+      expect(scanSecrets(diff, ["workspace/tests/app.test.ts"])).not.toContain("Generic secret assignment");
+    });
+
+    it("should flag sensitive filenames and avoid false positives", () => {
+      expect(scanSecrets("", [".env"])).toContain("Sensitive file (.env/.pem/.key/credentials/secrets) in changeset");
+      expect(scanSecrets("", ["src/cert.pem"])).toContain("Sensitive file (.env/.pem/.key/credentials/secrets) in changeset");
+      expect(scanSecrets("", ["src/server.key"])).toContain("Sensitive file (.env/.pem/.key/credentials/secrets) in changeset");
+      expect(scanSecrets("", ["src/sort.key.ts"])).not.toContain("Sensitive file (.env/.pem/.key/credentials/secrets) in changeset");
+    });
+
+    it("should allow .env.example", () => {
+      expect(scanSecrets("", [".env.example"])).not.toContain("Sensitive file (.env/.pem/.key/credentials/secrets) in changeset");
+    });
+  });
+
+  describe("scanSecretWarnings", () => {
+    it("should generate warnings for placeholder secrets", () => {
+      const diff = "+ const API_KEY = 'example_key';";
+      const warnings = scanSecretWarnings(diff);
+      expect(warnings.length).toBe(1);
+      expect(warnings[0]).toContain("Placeholder secret-style assignment");
+    });
+  });
+
+  describe("checkEvidenceStamp", () => {
+    it("passes stamped runner output", () => {
+      expect(checkEvidenceStamp("[runner-executed] 'go test ./...' exit=0\ngo test ok")).toBe("ok");
+    });
+    it("fails unstamped pasted output", () => {
+      expect(checkEvidenceStamp("go test ok\nall passing")).toBe("unstamped");
+    });
+    it("warns when no evidence at all", () => {
+      expect(checkEvidenceStamp("did some work, trust me")).toBe("missing-evidence");
+    });
+  });
+
+  describe("GATE_VERSION", () => {
+    it("should be a number", () => {
+      expect(typeof GATE_VERSION).toBe("number");
+      expect(GATE_VERSION).toBeGreaterThan(0);
+    });
+  });
+
+  describe("content scans", () => {
+    const h = (f: string) => `+++ b/${f}`;
+    it("flags SQL concatenation outside tests", () => {
+      const diff = `${h("workspace/api/db.ts")}\n+const q = "SELECT * FROM t WHERE id=" + id;`;
+      expect(scanSqlInjection(diff).length).toBeGreaterThan(0);
+      const param = `${h("workspace/api/db.ts")}\n+const q = await db.query("SELECT * FROM t WHERE id=$1", [id]);`;
+      expect(scanSqlInjection(param)).toEqual([]);
+      const test = `${h("workspace/api/db.test.ts")}\n+const q = "SELECT x" + y;`;
+      expect(scanSqlInjection(test)).toEqual([]);
+    });
+    it("flags embedded fallback layers outside tests", () => {
+      const diff = `${h("workspace/src/db.ts")}\n+import Database from "better-sqlite3";`;
+      expect(scanFallbackLayers(diff).length).toBeGreaterThan(0);
+      const mem = `${h("workspace/api/s.ts")}\n+const db = new Database(':memory:');`;
+      expect(scanFallbackLayers(mem).length).toBeGreaterThan(0);
+      const pg = `${h("workspace/api/s.ts")}\n+const db = new Database(process.env.DATABASE_URL);`;
+      expect(scanFallbackLayers(pg)).toEqual([]);
+    });
+    it("warns on mock-money literals and dead controls (never fails)", () => {
+      const diff = `${h("workspace/web/Bal.tsx")}\n+const mockBalance = 100;\n+<a href="#">x</a>`;
+      expect(scanDemoSmells(diff).length).toBeGreaterThan(0);
+    });
+    it("skips minified bundles in content scans (027 dist false-positive)", () => {
+      const diff = `${h("workspace/web/dist/assets/index-SSZJwS87.js")}\n+var Nr=Symbol.for("x");SELECT a+"b";`;
+      expect(scanSqlInjection(diff)).toEqual([]);
+      expect(scanDemoSmells(diff)).toEqual([]);
+      expect(scanFallbackLayers(diff)).toEqual([]);
+    });
+    it("catches stripe live keys and credential-store filenames", () => {
+      const diff = `${h("workspace/api/pay.ts")}\n+const k = "sk_live_abc123";`;
+      expect(scanSecrets(diff, ["workspace/api/pay.ts"]).join(" ")).toMatch(/Stripe/);
+      expect(scanSecrets("", ["workspace/credentials.json"])).toContain(
+        "Sensitive file (.env/.pem/.key/credentials/secrets) in changeset"
+      );
+    });
+  });
+
+  describe("isAllowedFile", () => {
+    const task = { targetFiles: ["workspace/api/handlers/auth.go"] } as any;
+    it("allows lockfiles and manifests at any depth (scope regression)", () => {
+      for (const f of [
+        "workspace/go.mod",
+        "workspace/go.sum",
+        "workspace/web/bun.lock",
+        "workspace/web/package.json",
+        "workspace/api/Cargo.lock",
+        "workspace/svc/requirements.txt",
+        "workspace/svc/composer.lock",
+      ]) {
+        expect(isAllowedFile(task, f)).toBe(true);
+      }
+    });
+    it("still rejects dependency trees and unrelated sources", () => {
+      for (const f of [
+        "workspace/web/node_modules/.bin/esbuild",
+        "workspace/web/node_modules/react/index.js",
+        "workspace/api/target/debug/app",
+        "workspace/other/thing.go",
+      ]) {
+        expect(isAllowedFile(task, f)).toBe(false);
+      }
+    });
+    it("allows the task's own scope, progress, and contracts", () => {
+      expect(isAllowedFile(task, "workspace/api/handlers/auth.go")).toBe(true);
+      expect(isAllowedFile(task, "workspace/TASK_PROGRESS.md")).toBe(true);
+      expect(isAllowedFile(task, "workspace/CONTRACTS.md")).toBe(true);
+    });
+  });
+});
