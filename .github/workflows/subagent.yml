@@ -120,7 +120,7 @@ jobs:
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
           export PATH="$HOME/.bun/bin:$PATH"
           mkdir -p "$HOME/.config/opencode"
-          printf '{\n  "permission": {\n    "*": "allow"\n  }\n}\n' > "$HOME/.config/opencode/opencode.json"
+          printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > "$HOME/.config/opencode/opencode.json"
           opencode --version || echo "OpenCode installed"
 
       - name: 📦 Install Project Dependencies
