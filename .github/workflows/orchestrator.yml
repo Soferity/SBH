@@ -156,6 +156,18 @@ jobs:
           printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > "$HOME/.config/opencode/opencode.json"
           opencode --version || echo "OpenCode installed"
 
+      - name: 🔐 Import OpenCode credentials (optional)
+        # Non-interactive login: `auth login` needs a TTY for the key prompt,
+        # but `auth import` reads exported credentials from stdin. Export
+        # locally (`opencode auth export`) and store it as OPENCODE_AUTH_EXPORT.
+        if: ${{ secrets.OPENCODE_AUTH_EXPORT != '' }}
+        env:
+          OPENCODE_AUTH_EXPORT: ${{ secrets.OPENCODE_AUTH_EXPORT }}
+        run: |
+          export PATH="$HOME/.bun/bin:$PATH"
+          printf '%s' "$OPENCODE_AUTH_EXPORT" | opencode auth import
+          opencode auth list || true
+
       - name: 📦 Install Project Dependencies
         # Frozen lockfile: CI must never resolve-and-rewrite bun.lock (dirty
         # tree aborts branch checkouts; builds stop being reproducible).
