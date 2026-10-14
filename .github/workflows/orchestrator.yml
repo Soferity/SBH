@@ -170,8 +170,18 @@ jobs:
             echo "No OPENCODE_AUTH_EXPORT secret; skipping credential import."
             exit 0
           fi
-          printf '%s' "$OPENCODE_AUTH_EXPORT" | opencode auth import
-          opencode auth list || true
+          case "$OPENCODE_AUTH_EXPORT" in
+            '['*)
+              printf '%s' "$OPENCODE_AUTH_EXPORT" | opencode auth import
+              opencode auth list || true
+              ;;
+            *)
+              # Raw API key (not `auth export` JSON): the provider reads
+              # OPENCODE_API_KEY straight from env, so expose it to later steps.
+              echo "OPENCODE_AUTH_EXPORT is a raw API key; exposing as OPENCODE_API_KEY for subsequent steps."
+              printf 'OPENCODE_API_KEY=%s\n' "$OPENCODE_AUTH_EXPORT" >> "$GITHUB_ENV"
+              ;;
+          esac
 
       - name: 📦 Install Project Dependencies
         # Frozen lockfile: CI must never resolve-and-rewrite bun.lock (dirty
