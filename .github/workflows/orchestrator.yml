@@ -132,9 +132,6 @@ jobs:
           tools: composer
 
       - name: ⚡ Cache Bun Modules & OpenCode Binary
-        # TEMP-DISABLED: force fresh bun modules + CLI every run while
-        # debugging provider auth; re-enable by deleting the next line.
-        if: false
         uses: actions/cache@v6
         with:
           path: |
