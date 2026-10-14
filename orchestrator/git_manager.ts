@@ -688,9 +688,11 @@ export class GitManager {
   public static progressMergeDriverContent(existing: string | null): string | null {
     const rule = GitManager.PROGRESS_MERGE_RULE;
     if (existing === null || existing.trim().length === 0) {
-      return `# Auto detect text files and perform LF normalization\n* text=auto\n\n` +
+      return (
+        `# Auto detect text files and perform LF normalization\n* text=auto\n\n` +
         `# Per-task scratch report: keep the destination copy on conflict so\n` +
-        `# task merges never block on this regenerable file.\n${rule}\n`;
+        `# task merges never block on this regenerable file.\n${rule}\n`
+      );
     }
     const normalized = existing.replace(/\r\n/g, "\n");
     if (normalized.split("\n").some((l) => l.trim() === rule)) return null;
@@ -714,11 +716,7 @@ export class GitManager {
     }
     const content = GitManager.progressMergeDriverContent(existing);
     if (content === null) return true;
-    return this.publishFileToData(
-      ".gitattributes",
-      content,
-      "chore(data): ensure TASK_PROGRESS.md merge driver"
-    );
+    return this.publishFileToData(".gitattributes", content, "chore(data): ensure TASK_PROGRESS.md merge driver");
   }
 
   /**
