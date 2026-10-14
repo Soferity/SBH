@@ -606,8 +606,7 @@ export class OpenCodeClient {
         await ensureSession();
         useContinuation = !!lastSessionId && !retryRes.timedOut;
         useFork = !!lastSessionId && retryRes.timedOut;
-        const variantDetail =
-          OpenCodeClient.extractErrorDetail(retryRes.stdout) || OpenCodeClient.extractErrorDetail(res.stdout);
+        const variantDetail = OpenCodeClient.extractErrorDetail(retryRes.stdout) || OpenCodeClient.extractErrorDetail(res.stdout);
         if (OpenCodeClient.isFreeTierAuthError(variantDetail, retryRes.stderr || res.stderr)) {
           // Same poisoned-session rule as the main path: never continue a
           // free-tier-gated session into the next model.
@@ -679,10 +678,11 @@ export class OpenCodeClient {
               usage: usageTotal(),
             };
           }
-          const freshDetail =
-            OpenCodeClient.extractErrorDetail(freshRes.stdout) || OpenCodeClient.extractErrorDetail(res.stdout);
+          const freshDetail = OpenCodeClient.extractErrorDetail(freshRes.stdout) || OpenCodeClient.extractErrorDetail(res.stdout);
           if (!OpenCodeClient.isFreeTierAuthError(freshDetail, freshRes.stderr)) break;
-          console.warn(`⚠️ [OpenCode] ${label} fresh retry ${r + 1} still gated; ${r + 1 < OpenCodeClient.FREE_TIER_MAX_RETRIES ? "retrying" : "moving on"}...`);
+          console.warn(
+            `⚠️ [OpenCode] ${label} fresh retry ${r + 1} still gated; ${r + 1 < OpenCodeClient.FREE_TIER_MAX_RETRIES ? "retrying" : "moving on"}...`
+          );
           retried = true;
           lastResult = {
             stdout: freshParsed,
