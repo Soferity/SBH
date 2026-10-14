@@ -127,11 +127,16 @@ jobs:
         # Non-interactive login: `auth login` needs a TTY for the key prompt,
         # but `auth import` reads exported credentials from stdin. Export
         # locally (`opencode auth export`) and store it as OPENCODE_AUTH_EXPORT.
-        if: ${{ secrets.OPENCODE_AUTH_EXPORT != '' }}
+        # NOTE: `secrets` is not usable in `if:` here, so emptiness is checked
+        # in bash; a missing secret skips silently.
         env:
           OPENCODE_AUTH_EXPORT: ${{ secrets.OPENCODE_AUTH_EXPORT }}
         run: |
           export PATH="$HOME/.bun/bin:$PATH"
+          if [ -z "$OPENCODE_AUTH_EXPORT" ]; then
+            echo "No OPENCODE_AUTH_EXPORT secret; skipping credential import."
+            exit 0
+          fi
           printf '%s' "$OPENCODE_AUTH_EXPORT" | opencode auth import
           opencode auth list || true
 
