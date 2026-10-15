@@ -107,7 +107,7 @@ jobs:
           # Lockfile + CLI pin in the key: a bun.lock-only change or an
           # @opencode/cli bump must invalidate, or warm runners restore
           # stale modules / skip the new binary forever.
-          key: ${{ runner.os }}-bun-cache-${{ hashFiles('package.json', 'bun.lock') }}-opencode-2.0.29
+          key: ${{ runner.os }}-bun-cache-${{ hashFiles('package.json', 'bun.lock') }}-opencode-2.0.30
           restore-keys: |
             ${{ runner.os }}-bun-cache-
 
@@ -115,40 +115,13 @@ jobs:
         run: |
           if ! command -v opencode &> /dev/null; then
             echo "Installing OpenCode CLI..."
-            bun install -g --trust @opencode/cli@2.0.29
+            bun install -g --trust @opencode/cli@2.0.30
           fi
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
           export PATH="$HOME/.bun/bin:$PATH"
           mkdir -p "$HOME/.config/opencode"
-          printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > "$HOME/.config/opencode/opencode.json"
+          printf '{\n  "permission": {\n    "*": "allow"\n  }\n}\n' > "$HOME/.config/opencode/opencode.json"
           opencode --version || echo "OpenCode installed"
-
-      - name: 🔐 Import OpenCode credentials (optional)
-        # Non-interactive login: `auth login` needs a TTY for the key prompt,
-        # but `auth import` reads exported credentials from stdin. Export
-        # locally (`opencode auth export`) and store it as OPENCODE_AUTH_EXPORT.
-        # NOTE: `secrets` is not usable in `if:` here, so emptiness is checked
-        # in bash; a missing secret skips silently.
-        env:
-          OPENCODE_AUTH_EXPORT: ${{ secrets.OPENCODE_AUTH_EXPORT }}
-        run: |
-          export PATH="$HOME/.bun/bin:$PATH"
-          if [ -z "$OPENCODE_AUTH_EXPORT" ]; then
-            echo "No OPENCODE_AUTH_EXPORT secret; skipping credential import."
-            exit 0
-          fi
-          case "$OPENCODE_AUTH_EXPORT" in
-            '['*)
-              printf '%s' "$OPENCODE_AUTH_EXPORT" | opencode auth import
-              opencode auth list || true
-              ;;
-            *)
-              # Raw API key (not `auth export` JSON): the provider reads
-              # OPENCODE_API_KEY straight from env, so expose it to later steps.
-              echo "OPENCODE_AUTH_EXPORT is a raw API key; exposing as OPENCODE_API_KEY for subsequent steps."
-              printf 'OPENCODE_API_KEY=%s\n' "$OPENCODE_AUTH_EXPORT" >> "$GITHUB_ENV"
-              ;;
-          esac
 
       - name: 📦 Install Project Dependencies
         # Frozen lockfile (see orchestrator.yml): never rewrite bun.lock on CI.

@@ -156,24 +156,6 @@ export class OpenCodeClient {
     return undefined;
   }
 
-  /**
-   * True when an attempt failed on the free-tier auth gate (server-side 403
-   * "FreeTierError", flaps included) rather than on the task itself.
-   * Such sessions are poisoned: continuing them (--session) fails
-   * deterministically, so callers must retry fresh instead.
-   * See upstream anomalyco/opencode#50627 and #55476.
-   */
-  public static isFreeTierAuthError(detail?: string, stderr?: string): boolean {
-    const hay = `${detail || ""}\n${stderr || ""}`;
-    return /free[\s-]?tier|FreeTierError|within OpenCode|provider\.auth|status\s*(code\s*)?403|error\s*403/i.test(hay);
-  }
-
-  /** Backoff between fresh retries of the same model after a free-tier 403 flap. */
-  public static readonly FREE_TIER_RETRY_DELAY_MS = 20_000;
-
-  /** Bounded same-model fresh retries on free-tier 403s before falling through. */
-  public static readonly FREE_TIER_MAX_RETRIES = 2;
-
   /** Cost/tokens/steps summed over step_finish events (units as reported). */
   public static extractUsage(rawStdout: string): OpenCodeUsage {
     const out = { cost: 0, tokens: 0, steps: 0 };
@@ -606,15 +588,6 @@ export class OpenCodeClient {
         await ensureSession();
         useContinuation = !!lastSessionId && !retryRes.timedOut;
         useFork = !!lastSessionId && retryRes.timedOut;
-        const variantDetail = OpenCodeClient.extractErrorDetail(retryRes.stdout) || OpenCodeClient.extractErrorDetail(res.stdout);
-        if (OpenCodeClient.isFreeTierAuthError(variantDetail, retryRes.stderr || res.stderr)) {
-          // Same poisoned-session rule as the main path: never continue a
-          // free-tier-gated session into the next model.
-          console.warn(`🔄 [OpenCode] Free-tier auth gate hit on ${label}; dropping poisoned session.`);
-          lastSessionId = undefined;
-          useContinuation = false;
-          useFork = false;
-        }
         console.warn(
           `⚠️ [OpenCode] Model ${label} encountered an issue (Exit: ${res.exitCode}, ApiError: ${isApiError}, ContentLength: ${parsedStdout.length}). Falling back to next model...`
         );
@@ -639,74 +612,6 @@ export class OpenCodeClient {
       console.warn(`   ↳ stderr tail: ${(res.stderr || "(empty)").slice(-400)}`);
       const detail = OpenCodeClient.extractErrorDetail(res.stdout);
       if (detail) console.warn(`   ↳ error event: ${detail.slice(0, 300)}`);
-      // Free-tier 403 flap: the session is poisoned (continuing it fails
-      // deterministically — see #55476), so drop it and retry the SAME model
-      // fresh with the full prompt before burning through the chain (#50627).
-      if (OpenCodeClient.isFreeTierAuthError(detail, res.stderr)) {
-        console.warn(`🔄 [OpenCode] Free-tier auth gate hit on ${label}; dropping poisoned session and retrying fresh...`);
-        lastSessionId = undefined;
-        useContinuation = false;
-        useFork = false;
-        let retried = false;
-        for (let r = 0; r < OpenCodeClient.FREE_TIER_MAX_RETRIES; r++) {
-          await Bun.sleep(OpenCodeClient.FREE_TIER_RETRY_DELAY_MS);
-          const freshRes = await attempt(
-            OpenCodeClient.buildCommand(spec, options?.files, undefined, cliExtra),
-            prompt,
-            `${label} (fresh retry ${r + 1}/${OpenCodeClient.FREE_TIER_MAX_RETRIES})`
-          );
-          const freshParsed = OpenCodeClient.extractText(freshRes.stdout);
-          if (freshRes.exitCode === 130) {
-            console.warn(`🛑 [OpenCode] ${label} fresh retry exited 130 (external cancel); stopping fallback chain.`);
-            return {
-              stdout: freshParsed,
-              stderr: freshRes.stderr,
-              exitCode: freshRes.exitCode,
-              modelUsed: label,
-              sessionId: lastSessionId,
-              usage: usageTotal(),
-            };
-          }
-          if (freshRes.exitCode === 0 && freshParsed.length > 0) {
-            console.log(`✨ [OpenCode] Success with model: ${label} (fresh retry ${r + 1})`);
-            return {
-              stdout: freshParsed,
-              stderr: freshRes.stderr,
-              exitCode: 0,
-              modelUsed: label,
-              sessionId: lastSessionId,
-              usage: usageTotal(),
-            };
-          }
-          const freshDetail = OpenCodeClient.extractErrorDetail(freshRes.stdout) || OpenCodeClient.extractErrorDetail(res.stdout);
-          if (!OpenCodeClient.isFreeTierAuthError(freshDetail, freshRes.stderr)) break;
-          console.warn(
-            `⚠️ [OpenCode] ${label} fresh retry ${r + 1} still gated; ${r + 1 < OpenCodeClient.FREE_TIER_MAX_RETRIES ? "retrying" : "moving on"}...`
-          );
-          retried = true;
-          lastResult = {
-            stdout: freshParsed,
-            stderr: freshRes.stderr || res.stderr,
-            exitCode: freshRes.exitCode,
-            modelUsed: label,
-            sessionId: lastSessionId,
-            errorDetail: freshDetail,
-            usage: usageTotal(),
-          };
-        }
-        if (!retried) {
-          lastResult = {
-            stdout: parsedStdout,
-            stderr: res.stderr,
-            exitCode: res.exitCode,
-            modelUsed: label,
-            sessionId: lastSessionId,
-            errorDetail: detail,
-            usage: usageTotal(),
-          };
-        }
-        continue;
-      }
       lastResult = {
         stdout: parsedStdout,
         stderr: res.stderr,
@@ -718,14 +623,10 @@ export class OpenCodeClient {
       };
     }
 
-    // Last resort attempt: run without specifying --model flag.
-    // A free-tier-gated session is never continued here: it is poisoned
-    // (#55476) and would fail deterministically, so go in fresh.
+    // Last resort attempt: run without specifying --model flag
     console.log("🔄 [OpenCode] Attempting last-resort execution without explicit --model flag...");
     const fallbackCmd = ["opencode", "run", "--format", "json"];
-    const lastWasGated = OpenCodeClient.isFreeTierAuthError(lastResult.errorDetail, lastResult.stderr);
-    const lsess = !lastWasGated && (useContinuation || useFork) ? lastSessionId : undefined;
-    if (lastWasGated) console.log("🔄 [OpenCode] Last resort starts a fresh session (previous one was free-tier gated).");
+    const lsess = useContinuation || useFork ? lastSessionId : undefined;
     if (lsess) fallbackCmd.push("--session", lsess);
     if (lsess && useFork) fallbackCmd.push("--fork");
     if (cliExtra.agent) fallbackCmd.push("--agent", cliExtra.agent);

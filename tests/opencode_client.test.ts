@@ -140,18 +140,6 @@ describe("OpenCode Client Module", () => {
       expect(OpenCodeClient.extractErrorDetail(`{"type":"text","text":"ok"}`)).toBeUndefined();
     });
 
-    it("isFreeTierAuthError detects the 403 gate in detail or stderr", () => {
-      expect(
-        OpenCodeClient.isFreeTierAuthError("OpenCode's free tier can only be used from within OpenCode.")
-      ).toBe(true);
-      expect(OpenCodeClient.isFreeTierAuthError(undefined, '{"type":"error","error":{"type":"FreeTierError"}}')).toBe(
-        true
-      );
-      expect(OpenCodeClient.isFreeTierAuthError("provider.auth failed", "status 403")).toBe(true);
-      expect(OpenCodeClient.isFreeTierAuthError("some task output", "")).toBe(false);
-      expect(OpenCodeClient.isFreeTierAuthError(undefined, undefined)).toBe(false);
-    });
-
     it("extractUsage sums cost/tokens/steps over step_finish events", () => {
       const raw = [
         `{"type":"step_finish","timestamp":1,"sessionID":"s","part":{"cost":0.5,"tokens":100}}`,
